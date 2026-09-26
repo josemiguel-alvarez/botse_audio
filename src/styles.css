@@ -1735,6 +1735,10 @@ button svg, [aria-hidden="true"] svg {
   margin-right: 6px;
 }
 
+.mb-volume[hidden] {
+  display: none;
+}
+
 .mb-vol-icon {
   font-size: 0.82rem;
   flex-shrink: 0;
