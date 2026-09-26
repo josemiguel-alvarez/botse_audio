@@ -185,7 +185,7 @@ let gremioCollapsed = typeof state.gremioCollapsed === "boolean" ? state.gremioC
 let narrationsCollapsed = typeof state.narrationsCollapsed === "boolean" ? state.narrationsCollapsed : false;
 let bandaCollapsed = typeof state.bandaCollapsed === "boolean" ? state.bandaCollapsed : false;
 
-/** @type {null | { rafId: number, panelEl: HTMLAudioElement, ambientEl: HTMLAudioElement|null, hasAmbient: boolean, totalDuration: number, playerEl: HTMLElement, isSeeking: boolean }} */
+/** @type {null | { tickId: number, panelEl: HTMLAudioElement, ambientEl: HTMLAudioElement|null, hasAmbient: boolean, totalDuration: number, playerEl: HTMLElement, isSeeking: boolean }} */
 let activePlayer = null;
 
 let contentTree = buildTreeFromStart();
@@ -380,10 +380,17 @@ const stCachedIds = new Set(JSON.parse(localStorage.getItem("botse_audio:stCache
 
 /** @type {HTMLAudioElement | null} */
 let stAudio = null;
-/** @type {AudioContext | null} */
-let stAudioCtx = null;
-/** @type {GainNode | null} */
-let stGainNode = null;
+// iOS ignora las escrituras sobre HTMLMediaElement.volume. Se detecta una sola
+// vez para saber si el control de volumen/atenuación es posible sin Web Audio.
+const stCanSetVolume = (() => {
+  try {
+    const probe = new Audio();
+    probe.volume = 0.5;
+    return probe.volume === 0.5;
+  } catch (_) {
+    return false;
+  }
+})();
 let stCurrentTrack = (typeof state.stCurrentTrack === "number" && state.stCurrentTrack >= 0 && state.stCurrentTrack < SOUNDTRACK.length) ? state.stCurrentTrack : 0;
 let stVolume = (typeof state.stVolume === "number" && state.stVolume >= 0 && state.stVolume <= 100) ? state.stVolume : 100;
 let stRestoreTime = (typeof state.stCurrentTime === "number" && state.stCurrentTime > 0) ? state.stCurrentTime : 0;
@@ -414,15 +421,10 @@ function setupSTPlayer() {
   if (!SOUNDTRACK.length) return;
   stAudio = new Audio();
   stAudio.preload = "metadata";
-  try {
-    stAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    stGainNode = stAudioCtx.createGain();
-    stAudioCtx.createMediaElementSource(stAudio).connect(stGainNode);
-    stGainNode.connect(stAudioCtx.destination);
-    stGainNode.gain.value = stVolume / 100;
-  } catch (_) {
-    stAudio.volume = stVolume / 100;
-  }
+  // Importante: NO enrutar el elemento por un AudioContext. En iOS, el audio
+  // servido vía Web Audio se silencia al bloquear la pantalla (el contexto pasa
+  // a "interrupted" y no puede reanudarse desde segundo plano).
+  stAudio.volume = stVolume / 100;
   stAudio.addEventListener("ended", () => {
     stCurrentTrack = (stCurrentTrack + 1) % SOUNDTRACK.length;
     loadSTTrack(stCurrentTrack).then(() => {
@@ -565,13 +567,11 @@ async function downloadSTIfNeeded() {
 }
 
 function setSTGain(value) {
-  if (stGainNode) stGainNode.gain.value = value;
-  else if (stAudio) stAudio.volume = value;
+  if (stAudio && stCanSetVolume) stAudio.volume = value;
 }
 
 function getSTGain() {
-  if (stGainNode) return stGainNode.gain.value;
-  if (stAudio) return stAudio.volume;
+  if (stAudio && stCanSetVolume) return stAudio.volume;
   return stVolume / 100;
 }
 
@@ -584,7 +584,7 @@ function duckST() {
 
 function duckSTFade(onDone) {
   const targetVol = Math.min(stVolume, 20) / 100;
-  if (!stEnabled || !stAudio || stAudio.paused) {
+  if (!stEnabled || !stAudio || stAudio.paused || !stCanSetVolume) {
     onDone();
     return;
   }
@@ -620,6 +620,10 @@ function restoreST() {
 function restoreSTFade() {
   stIsDucked = false;
   if (!stEnabled || !stAudio || stAudio.paused) return;
+  if (!stCanSetVolume) {
+    updateSTMediaSession(true);
+    return;
+  }
   const targetVol = stVolume / 100;
   if (getSTGain() >= targetVol) {
     setSTGain(targetVol);
@@ -710,7 +714,7 @@ function renderMusicBar() {
         <input type="range" class="mb-seekbar" id="st-seekbar" min="0" max="1000" value="0" step="1" aria-label="${escapeAttribute(t("soundtrackPlayer.seek"))}">
         <span class="mb-time" id="st-total-time">-:--</span>
       </div>
-      <div class="mb-volume">
+      <div class="mb-volume"${stCanSetVolume ? "" : ' hidden'}>
         <span class="mb-vol-icon" aria-hidden="true">${ICONS.speaker}</span>
         <input type="range" class="mb-volume-slider" id="st-volume" min="0" max="100" value="${stVolume}" step="1" aria-label="${escapeAttribute(t("soundtrackPlayer.volume"))}">
       </div>
@@ -727,7 +731,6 @@ function engageMusic() {
   stEnabled = true;
   setupSTPlayer();
   loadSTTrack(stCurrentTrack).then(() => {
-    stAudioCtx?.resume();
     stAudio?.play().catch(() => {});
     updateSTMediaSession(true);
     updateSTUI();
@@ -743,7 +746,6 @@ function engageMusic() {
 function stPlayPause() {
   if (!stEnabled || !stAudio) { engageMusic(); return; }
   if (stAudio.paused) {
-    stAudioCtx?.resume();
     stAudio.play().catch(() => {});
     updateSTMediaSession(true);
   } else {
@@ -1414,10 +1416,7 @@ window.addEventListener("pagehide", () => {
 
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) saveState();
-});
-
-window.addEventListener("pagehide", (e) => {
-  if (!e.persisted && activePlayer?.playing) pauseActivePlayerInternal();
+  else if (activePlayer?.playing) resyncActivePlayerAfterWake();
 });
 
 function registerServiceWorker() {
@@ -1866,15 +1865,51 @@ function stopActivePlayer() {
     navigator.mediaSession.playbackState = "none";
   }
   restoreSTFade();
-  cancelAnimationFrame(activePlayer.rafId);
-  activePlayer.rafId = 0;
+  stopPlayerTick(activePlayer);
   activePlayer.playing = false;
   activePlayer.panelEl.pause();
   if (activePlayer.ambientEl) activePlayer.ambientEl.pause();
   activePlayer = null;
 }
 
-function playerRaf() {
+// El bucle del reproductor usa un temporizador, no requestAnimationFrame: rAF se
+// congela con la pantalla bloqueada o la pestaña en segundo plano, lo que dejaba
+// la máquina de estados (pre-roll → narración → fundido) detenida a medias.
+const PLAYER_TICK_MS = 200;
+
+function startPlayerTick(p) {
+  if (!p || p.tickId) return;
+  p.tickId = setInterval(playerTick, PLAYER_TICK_MS);
+}
+
+function stopPlayerTick(p) {
+  if (!p) return;
+  if (p.tickId) clearInterval(p.tickId);
+  p.tickId = 0;
+}
+
+// Tras volver de segundo plano el temporizador puede haber quedado suspendido:
+// se recalcula el estado de inmediato y se reanuda cualquier elemento que el
+// sistema haya pausado.
+function resyncActivePlayerAfterWake() {
+  const p = activePlayer;
+  if (!p || !p.playing) return;
+  if (p.hasAmbient) {
+    if ((p.phase === "pre-roll" || p.phase === "fade-out") && p.ambientEl?.paused) {
+      p.ambientEl.play().catch(() => {});
+    }
+    if (p.phase === "playing") {
+      if (p.ambientEl?.paused) p.ambientEl.play().catch(() => {});
+      if (p.panelEl.paused && !p.panelEl.ended) p.panelEl.play().catch(() => {});
+    }
+  } else if (p.panelEl.paused && !p.panelEl.ended) {
+    p.panelEl.play().catch(() => {});
+  }
+  startPlayerTick(p);
+  playerTick();
+}
+
+function playerTick() {
   if (!activePlayer) return;
   const p = activePlayer;
 
@@ -1913,13 +1948,12 @@ function playerRaf() {
         p.playing = false;
         updateMediaSession(false);
         restoreSTFade();
-        cancelAnimationFrame(p.rafId);
-        p.rafId = 0;
+        stopPlayerTick(p);
         p.phase = "ended";
         return;
       }
     } else {
-      // ended — rAF should not be running
+      // ended — el temporizador no debería estar activo
       return;
     }
   } else {
@@ -1931,15 +1965,14 @@ function playerRaf() {
       p.playing = false;
       updateMediaSession(false);
       restoreSTFade();
-      cancelAnimationFrame(p.rafId);
-      p.rafId = 0;
+      stopPlayerTick(p);
       p.phase = "ended";
       return;
     }
   }
 
   updatePlayerUI(p, vt);
-  p.rafId = requestAnimationFrame(playerRaf);
+  startPlayerTick(p);
 }
 
 function updatePlayerUI(p, vt) {
@@ -1964,8 +1997,7 @@ function seekPlayer(vt) {
   const p = activePlayer;
   const clamped = Math.max(0, Math.min(vt, p.totalDuration));
 
-  cancelAnimationFrame(p.rafId);
-  p.rafId = 0;
+  stopPlayerTick(p);
 
   const wasPlaying = p.hasAmbient
     ? !(p.ambientEl?.paused ?? true)
@@ -2008,7 +2040,7 @@ function seekPlayer(vt) {
   }
 
   if (wasPlaying) {
-    p.rafId = requestAnimationFrame(playerRaf);
+    startPlayerTick(p);
   } else {
     updatePlayerUI(p, clamped);
   }
@@ -2022,8 +2054,7 @@ function updateMediaSession(playing) {
 function pauseActivePlayerInternal() {
   if (!activePlayer) return;
   const p = activePlayer;
-  cancelAnimationFrame(p.rafId);
-  p.rafId = 0;
+  stopPlayerTick(p);
   if (p.hasAmbient) {
     if (p.phase === "pre-roll") {
       const elapsed = (performance.now() - p.phaseStartMs) / 1000 / p.panelEl.playbackRate;
@@ -2064,7 +2095,7 @@ function resumeActivePlayerInternal() {
     if (!p.panelEl.ended) p.panelEl.play().catch(() => {});
   }
   p.playing = true;
-  p.rafId = requestAnimationFrame(playerRaf);
+  startPlayerTick(p);
   setPlayerBtnState(p.playerEl, true);
   updateMediaSession(true);
   duckST();
@@ -2077,7 +2108,7 @@ function initPlayer(contentEl, panelEl, ambientEl, totalDuration, panelDuration)
   const hasAmbient = !!ambientEl;
 
   activePlayer = {
-    rafId: 0,
+    tickId: 0,
     playerEl,
     panelEl,
     ambientEl: ambientEl || null,
@@ -2117,7 +2148,7 @@ function initPlayer(contentEl, panelEl, ambientEl, totalDuration, panelDuration)
       activePlayer.fadeOutPosAtStart = 0;
       activePlayer.phaseStartMs = performance.now();
       if (activePlayer.ambientEl) activePlayer.ambientEl.volume = 0.25;
-      if (!activePlayer.rafId) activePlayer.rafId = requestAnimationFrame(playerRaf);
+      startPlayerTick(activePlayer);
     });
   }
 
@@ -2152,7 +2183,7 @@ function initPlayer(contentEl, panelEl, ambientEl, totalDuration, panelDuration)
         p.fadeOutPosAtStart = 0;
         p.phaseStartMs = performance.now();
         p.ambientEl?.play().catch(() => {});
-        p.rafId = requestAnimationFrame(playerRaf);
+        startPlayerTick(p);
         setPlayerBtnState(playerEl, true);
         p.playing = true;
         updateMediaSession(true);
@@ -2164,8 +2195,7 @@ function initPlayer(contentEl, panelEl, ambientEl, totalDuration, panelDuration)
 
       if (isPlaying) {
         // Pause — accumulate progress in current phase
-        cancelAnimationFrame(p.rafId);
-        p.rafId = 0;
+        stopPlayerTick(p);
         if (p.phase === "pre-roll") {
           const elapsed = (performance.now() - p.phaseStartMs) / 1000 / p.panelEl.playbackRate;
           p.preRollPosAtStart = Math.min(1, p.preRollPosAtStart + elapsed);
@@ -2196,7 +2226,7 @@ function initPlayer(contentEl, panelEl, ambientEl, totalDuration, panelDuration)
             p.ambientEl.play().catch(() => {});
           }
         }
-        p.rafId = requestAnimationFrame(playerRaf);
+        startPlayerTick(p);
         setPlayerBtnState(playerEl, true);
         p.playing = true;
         updateMediaSession(true);
@@ -2208,7 +2238,7 @@ function initPlayer(contentEl, panelEl, ambientEl, totalDuration, panelDuration)
         p.panelEl.currentTime = 0;
         p.phase = "playing";
         p.panelEl.play().catch(() => {});
-        p.rafId = requestAnimationFrame(playerRaf);
+        startPlayerTick(p);
         setPlayerBtnState(playerEl, true);
         p.playing = true;
         updateMediaSession(true);
@@ -2217,7 +2247,7 @@ function initPlayer(contentEl, panelEl, ambientEl, totalDuration, panelDuration)
       }
       if (p.panelEl.paused) {
         p.panelEl.play().catch(() => {});
-        p.rafId = requestAnimationFrame(playerRaf);
+        startPlayerTick(p);
         setPlayerBtnState(playerEl, true);
         p.playing = true;
         updateMediaSession(true);
@@ -2225,8 +2255,7 @@ function initPlayer(contentEl, panelEl, ambientEl, totalDuration, panelDuration)
       } else {
         p.playing = false;
         p.panelEl.pause();
-        cancelAnimationFrame(p.rafId);
-        p.rafId = 0;
+        stopPlayerTick(p);
         setPlayerBtnState(playerEl, false);
         updateMediaSession(false);
         restoreSTFade();
@@ -2299,7 +2328,7 @@ function togglePanel(panelId) {
               } else {
                 panelEl.play().catch(() => {});
               }
-              p.rafId = requestAnimationFrame(playerRaf);
+              startPlayerTick(p);
               setPlayerBtnState(p.playerEl, true);
               p.playing = true;
               updateMediaSession(true);
