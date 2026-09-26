@@ -380,9 +380,19 @@ const stCachedIds = new Set(JSON.parse(localStorage.getItem("botse_audio:stCache
 
 /** @type {HTMLAudioElement | null} */
 let stAudio = null;
-// iOS ignores writes to HTMLMediaElement.volume. Detected once to know whether
-// volume control/ducking is possible without Web Audio.
+// iOS ignores writes to HTMLMediaElement.volume. The property probe alone is not
+// reliable (a src-less element can report the assigned value while real playback
+// ignores it), so iOS/iPadOS is also detected explicitly.
+const stIsIOS = (() => {
+  const ua = navigator.userAgent || "";
+  const iOSDevice = /iPad|iPhone|iPod/.test(ua);
+  // iPadOS 13+ reports itself as Macintosh; touch points tell them apart.
+  const iPadOS = /Macintosh/.test(ua) && navigator.maxTouchPoints > 1;
+  return iOSDevice || iPadOS;
+})();
+
 const stCanSetVolume = (() => {
+  if (stIsIOS) return false;
   try {
     const probe = new Audio();
     probe.volume = 0.5;
@@ -575,43 +585,64 @@ function getSTGain() {
   return stVolume / 100;
 }
 
+// Ducking always ends in `muted`, never in a low volume alone: iOS discards
+// volume writes, so a volume-only duck is inaudible there. `muted` is honoured
+// on every platform and, unlike pause(), needs no user gesture to be reverted,
+// so the music returns even if the narration ends with the screen locked.
+function setSTMuted(muted) {
+  if (stAudio) stAudio.muted = muted;
+}
+
+// The fades run on a timer rather than requestAnimationFrame: rAF is frozen in
+// the background, which would strand the fade mid-way and, in duckSTFade, never
+// invoke the callback that starts the narration.
+const ST_FADE_STEP_MS = 50;
+
+function runSTFade(targetVol, durationMs, onDone) {
+  const startVol = getSTGain();
+  const startTime = performance.now();
+  const id = setInterval(() => {
+    const t = Math.min((performance.now() - startTime) / durationMs, 1);
+    setSTGain(startVol + (targetVol - startVol) * t);
+    if (t >= 1) {
+      clearInterval(id);
+      setSTGain(targetVol);
+      onDone();
+    }
+  }, ST_FADE_STEP_MS);
+}
+
 function duckST() {
   if (stEnabled && stAudio) {
     stIsDucked = true;
-    setSTGain(Math.min(stVolume, 20) / 100);
+    setSTMuted(true);
   }
 }
 
 function duckSTFade(onDone) {
-  const targetVol = Math.min(stVolume, 20) / 100;
-  if (!stEnabled || !stAudio || stAudio.paused || !stCanSetVolume) {
+  if (!stEnabled || !stAudio || stAudio.paused) {
     onDone();
     return;
   }
   stIsDucked = true;
-  if (getSTGain() <= targetVol) {
-    setSTGain(targetVol);
-    setTimeout(onDone, 300);
+  if (!stCanSetVolume) {
+    setSTMuted(true);
+    onDone();
     return;
   }
-  const startVol = getSTGain();
-  const startTime = performance.now();
-  const FADE_MS = 500;
-  function step() {
-    const t = Math.min((performance.now() - startTime) / FADE_MS, 1);
-    setSTGain(startVol + (targetVol - startVol) * t);
-    if (t < 1) {
-      requestAnimationFrame(step);
-    } else {
-      onDone();
-    }
-  }
-  requestAnimationFrame(step);
+  // Where volume works, fade down first so the cut is not abrupt.
+  runSTFade(0, 400, () => {
+    if (!stIsDucked) return;
+    setSTMuted(true);
+    setSTGain(stVolume / 100);
+    onDone();
+  });
 }
 
 function restoreST() {
   if (stEnabled && stAudio) {
     stIsDucked = false;
+    setSTMuted(false);
     setSTGain(stVolume / 100);
     if (!stAudio.paused) updateSTMediaSession(true);
   }
@@ -619,31 +650,31 @@ function restoreST() {
 
 function restoreSTFade() {
   stIsDucked = false;
-  if (!stEnabled || !stAudio || stAudio.paused) return;
+  if (!stEnabled || !stAudio) return;
+  // Paused: no fade to run, just leave it unmuted and at full level so the next
+  // play is not silent.
+  if (stAudio.paused) {
+    setSTMuted(false);
+    setSTGain(stVolume / 100);
+    return;
+  }
   if (!stCanSetVolume) {
+    setSTMuted(false);
     updateSTMediaSession(true);
     return;
   }
+  // Fade up from silence so the music does not burst back in.
   const targetVol = stVolume / 100;
+  if (stAudio.muted) setSTGain(0);
+  setSTMuted(false);
   if (getSTGain() >= targetVol) {
     setSTGain(targetVol);
     updateSTMediaSession(true);
     return;
   }
-  const startVol = getSTGain();
-  const startTime = performance.now();
-  const FADE_MS = 800;
-  function step() {
-    const t = Math.min((performance.now() - startTime) / FADE_MS, 1);
-    setSTGain(startVol + (targetVol - startVol) * t);
-    if (t < 1) {
-      requestAnimationFrame(step);
-    } else {
-      setSTGain(targetVol);
-      if (!stAudio.paused) updateSTMediaSession(true);
-    }
-  }
-  requestAnimationFrame(step);
+  runSTFade(targetVol, 800, () => {
+    if (!stAudio.paused) updateSTMediaSession(true);
+  });
 }
 
 function updateSTUI() {
@@ -746,6 +777,11 @@ function engageMusic() {
 function stPlayPause() {
   if (!stEnabled || !stAudio) { engageMusic(); return; }
   if (stAudio.paused) {
+    // Pressing play is an explicit request for music: it wins over any ducking
+    // still in place, which would otherwise start playback silently.
+    stIsDucked = false;
+    setSTMuted(false);
+    setSTGain(stVolume / 100);
     stAudio.play().catch(() => {});
     updateSTMediaSession(true);
   } else {
@@ -815,7 +851,9 @@ function bindMusicBarEvents() {
   musicBarEl.addEventListener("input", (event) => {
     if (event.target.id !== "st-volume") return;
     stVolume = parseInt(event.target.value, 10);
-    setSTGain((stIsDucked ? Math.min(stVolume, 30) : stVolume) / 100);
+    // While ducked the element is muted, so the new level simply becomes the
+    // one restored when the narration ends.
+    setSTGain(stVolume / 100);
     saveState();
   });
 }
@@ -833,6 +871,9 @@ function updateSTMediaSession(playing) {
       ]
     });
     navigator.mediaSession.setActionHandler("play", () => {
+      stIsDucked = false;
+      setSTMuted(false);
+      setSTGain(stVolume / 100);
       stAudio?.play().catch(() => {});
       updateSTUI();
       updateSTMediaSession(true);
