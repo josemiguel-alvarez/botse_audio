@@ -380,8 +380,8 @@ const stCachedIds = new Set(JSON.parse(localStorage.getItem("botse_audio:stCache
 
 /** @type {HTMLAudioElement | null} */
 let stAudio = null;
-// iOS ignora las escrituras sobre HTMLMediaElement.volume. Se detecta una sola
-// vez para saber si el control de volumen/atenuación es posible sin Web Audio.
+// iOS ignores writes to HTMLMediaElement.volume. Detected once to know whether
+// volume control/ducking is possible without Web Audio.
 const stCanSetVolume = (() => {
   try {
     const probe = new Audio();
@@ -421,9 +421,9 @@ function setupSTPlayer() {
   if (!SOUNDTRACK.length) return;
   stAudio = new Audio();
   stAudio.preload = "metadata";
-  // Importante: NO enrutar el elemento por un AudioContext. En iOS, el audio
-  // servido vía Web Audio se silencia al bloquear la pantalla (el contexto pasa
-  // a "interrupted" y no puede reanudarse desde segundo plano).
+  // Important: do NOT route the element through an AudioContext. On iOS, audio
+  // served via Web Audio goes silent when the screen is locked (the context
+  // becomes "interrupted" and cannot be resumed from the background).
   stAudio.volume = stVolume / 100;
   stAudio.addEventListener("ended", () => {
     stCurrentTrack = (stCurrentTrack + 1) % SOUNDTRACK.length;
@@ -1872,9 +1872,9 @@ function stopActivePlayer() {
   activePlayer = null;
 }
 
-// El bucle del reproductor usa un temporizador, no requestAnimationFrame: rAF se
-// congela con la pantalla bloqueada o la pestaña en segundo plano, lo que dejaba
-// la máquina de estados (pre-roll → narración → fundido) detenida a medias.
+// The player loop uses a timer, not requestAnimationFrame: rAF is frozen while
+// the screen is locked or the tab is in the background, which left the state
+// machine (pre-roll → narration → fade-out) stuck halfway.
 const PLAYER_TICK_MS = 200;
 
 function startPlayerTick(p) {
@@ -1888,9 +1888,9 @@ function stopPlayerTick(p) {
   p.tickId = 0;
 }
 
-// Tras volver de segundo plano el temporizador puede haber quedado suspendido:
-// se recalcula el estado de inmediato y se reanuda cualquier elemento que el
-// sistema haya pausado.
+// After returning from the background the timer may have been suspended: the
+// state is recomputed immediately and any element paused by the system is
+// resumed.
 function resyncActivePlayerAfterWake() {
   const p = activePlayer;
   if (!p || !p.playing) return;
@@ -1953,7 +1953,7 @@ function playerTick() {
         return;
       }
     } else {
-      // ended — el temporizador no debería estar activo
+      // ended — the timer should not be running
       return;
     }
   } else {
