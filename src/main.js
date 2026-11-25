@@ -3,13 +3,10 @@ import { t, getLang, setLang, LANGUAGES, getContent } from "./i18n.js";
 import SOUNDTRACK from "./i18n/es/soundtrack.json";
 import CardScanner, { CROP } from "./card-scanner.js";
 import {
-  RESTORE_RAMP_MS,
-  SOUNDTRACK_MODES,
   createSoundtrackGain,
   getAudioContextClass,
-  resolveSoundtrackMode,
   setAudioSessionType,
-  supportsEnhancedSoundtrack,
+  supportsSoundtrackGain,
 } from "./soundtrack-gain.js";
 import { applyMediaSessionControls, createNarrationDucking } from "./narration-ducking.js";
 
@@ -146,7 +143,6 @@ function loadState() {
     recognizerConfirmCard: false,
     playbackRate: 1,
     stEnabled: false,
-    stAudioMode: "compat",
     provinciaCollapsed: false,
     gremioCollapsed: false,
     narrationsCollapsed: false,
@@ -167,7 +163,6 @@ function saveState() {
       recognizerConfirmCard,
       playbackRate,
       stEnabled,
-      stAudioMode,
       provinciaCollapsed,
       gremioCollapsed,
       narrationsCollapsed,
@@ -188,9 +183,6 @@ let autoPlay = typeof state.autoPlay === "boolean" ? state.autoPlay : true;
 let recognizerConfirmCard = typeof state.recognizerConfirmCard === "boolean" ? state.recognizerConfirmCard : false;
 let playbackRate = [1, 1.15, 1.25, 1.5].includes(state.playbackRate) ? state.playbackRate : 1;
 let stEnabled = typeof (state.stEnabled ?? state.ytEnabled) === "boolean" ? (state.stEnabled ?? state.ytEnabled) : false;
-// Soundtrack backend requested by the user. Existing installations keep the
-// compatibility mode; the enhanced mode is opt-in while it is evaluated.
-let stAudioMode = state.stAudioMode === "enhanced" ? "enhanced" : "compat";
 
 // Vista activa: "inicio" (bienvenida) o "narraciones"
 let view = state.view === "narraciones" ? "narraciones" : "inicio";
@@ -395,65 +387,16 @@ const stCachedIds = new Set(JSON.parse(localStorage.getItem("botse_audio:stCache
 
 /** @type {HTMLAudioElement | null} */
 let stAudio = null;
-// iOS ignores writes to HTMLMediaElement.volume. The property probe alone is not
-// reliable (a src-less element can report the assigned value while real playback
-// ignores it), so iOS/iPadOS is also detected explicitly.
-const stIsIOS = (() => {
-  const ua = navigator.userAgent || "";
-  const iOSDevice = /iPad|iPhone|iPod/.test(ua);
-  // iPadOS 13+ reports itself as Macintosh; touch points tell them apart.
-  const iPadOS = /Macintosh/.test(ua) && navigator.maxTouchPoints > 1;
-  return iOSDevice || iPadOS;
-})();
-
-const stCanSetVolume = (() => {
-  if (stIsIOS) return false;
-  try {
-    const probe = new Audio();
-    probe.volume = 0.5;
-    return probe.volume === 0.5;
-  } catch (_) {
-    return false;
-  }
-})();
-
-// Two soundtrack backends:
-// - compat (default): native element output. Ducking ends in `muted` (instant
-//   on iOS, faded where volume works).
-// - enhanced (opt-in, iOS): the element is routed through a GainNode, so the
-//   music can be lowered instead of muted. It is offered on iOS/iPadOS only
-//   (and on any browser in development builds, to exercise it on a desktop).
-const stEnhancedSupported = supportsEnhancedSoundtrack(window);
-const stEnhancedOffered = stEnhancedSupported && (stIsIOS || import.meta.env.DEV);
-const resolveSTMode = () => resolveSoundtrackMode({
-  requested: stAudioMode,
-  isIOS: stIsIOS,
-  allowAnyPlatform: import.meta.env.DEV,
-  supported: stEnhancedSupported,
-});
-// How the current stAudio element is wired. Only changes by recreating it.
-let stActiveMode = resolveSTMode();
-const stIsEnhanced = () => stActiveMode === SOUNDTRACK_MODES.ENHANCED;
-const stSupportsVolumeControl = () => stIsEnhanced() || stCanSetVolume;
-
-// The playback session must be set before any audio starts.
-if (stIsEnhanced()) setAudioSessionType("playback");
-
 /** @type {ReturnType<typeof createSoundtrackGain> | null} */
 let stGain = null;
-/** @type {AbortController | null} listeners of the current stAudio element */
-let stListeners = null;
-// Whether the user wants the music playing. System pauses (calls, other apps)
-// do not change it, so foreground reconciliation never overrides a user pause.
-let stPlayIntent = false;
+
+// Must be set before any audio starts so iOS lets Web Audio keep playing on lock.
+if (supportsSoundtrackGain(window)) setAudioSessionType("playback");
 
 let stCurrentTrack = (typeof state.stCurrentTrack === "number" && state.stCurrentTrack >= 0 && state.stCurrentTrack < SOUNDTRACK.length) ? state.stCurrentTrack : 0;
 let stVolume = (typeof state.stVolume === "number" && state.stVolume >= 0 && state.stVolume <= 100) ? state.stVolume : 100;
 let stRestoreTime = (typeof state.stCurrentTime === "number" && state.stCurrentTime > 0) ? state.stCurrentTime : 0;
 let stSaveTickCount = 0;
-// Compatibility backend only: whether the mute/fade duck is applied.
-let stIsDucked = false;
-let stFadeId = 0;
 let stPollId = null;
 let stIsSeeking = false;
 let stIsDownloading = false;
@@ -463,111 +406,11 @@ const stObjectUrls = {}; // index → objectURL (para revocar al cambiar pista)
 
 // Narration lifecycle → requested ducking + lock-screen ownership.
 const narrationDucking = createNarrationDucking({
-  onChange: (snap, reason) => {
-    logAudio(`narration:${reason}`, { status: snap.status, owner: snap.owner });
+  onChange: (snap) => {
     applySTDuck(snap.ducked);
     syncMediaSession();
   },
 });
-
-// ── Audio diagnostics ─────────────────────────────────────
-// Ring buffer of audio events (context state, media events, positions and the
-// requested ducking state), persisted so a device test run with the screen
-// locked and no Web Inspector attached can be inspected afterwards.
-// A "running" context is recorded as such; it does not prove audible output.
-const AUDIO_DIAG_KEY = "botse_audio:audioDiag";
-const AUDIO_DIAG_LIMIT = 400;
-const audioDiag = (() => {
-  try {
-    const saved = JSON.parse(localStorage.getItem(AUDIO_DIAG_KEY) || "[]");
-    return Array.isArray(saved) ? saved.slice(-AUDIO_DIAG_LIMIT) : [];
-  } catch {
-    return [];
-  }
-})();
-let audioDiagSaveId = 0;
-const roundTime = (value) => (Number.isFinite(value) ? Math.round(value * 100) / 100 : null);
-
-function logAudio(event, details) {
-  const p = activePlayer;
-  audioDiag.push({
-    at: new Date().toISOString(),
-    ev: event,
-    vis: document.visibilityState,
-    mode: stActiveMode,
-    ctx: stGain ? stGain.contextState : null,
-    gain: stGain ? roundTime(stGain.currentValue()) : null,
-    st: stAudio ? { paused: stAudio.paused, t: roundTime(stAudio.currentTime), muted: stAudio.muted } : null,
-    duck: narrationDucking.snapshot().ducked,
-    nar: p ? { phase: p.phase, playing: p.playing, t: roundTime(p.panelEl.currentTime) } : null,
-    ...details,
-  });
-  if (audioDiag.length > AUDIO_DIAG_LIMIT) audioDiag.splice(0, audioDiag.length - AUDIO_DIAG_LIMIT);
-  if (import.meta.env.DEV) console.debug("[audio]", event, details ?? "");
-  if (!audioDiagSaveId) audioDiagSaveId = setTimeout(flushAudioDiag, 1000);
-}
-
-function flushAudioDiag() {
-  clearTimeout(audioDiagSaveId);
-  audioDiagSaveId = 0;
-  try {
-    localStorage.setItem(AUDIO_DIAG_KEY, JSON.stringify(audioDiag));
-  } catch {}
-}
-
-function audioDiagReport() {
-  return JSON.stringify({
-    userAgent: navigator.userAgent,
-    standalone: window.matchMedia?.("(display-mode: standalone)")?.matches || navigator.standalone === true,
-    audioSession: navigator.audioSession?.type ?? null,
-    requestedMode: stAudioMode,
-    activeMode: stActiveMode,
-    entries: audioDiag,
-  }, null, 1);
-}
-
-// Console access: copy(botseAudioDiag.report())
-window.botseAudioDiag = {
-  entries: () => audioDiag.slice(),
-  report: audioDiagReport,
-  clear: () => { audioDiag.length = 0; flushAudioDiag(); },
-};
-
-async function exportAudioDiagnostics() {
-  const report = audioDiagReport();
-  try {
-    await navigator.clipboard.writeText(report);
-    showAudioNotice(t("audio.diagnosticsCopied"));
-    return;
-  } catch {}
-  // Clipboard unavailable: offer the report as a file instead.
-  const url = URL.createObjectURL(new Blob([report], { type: "application/json" }));
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `botse-audio-diag-${Date.now()}.json`;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 10000);
-  showAudioNotice(t("audio.diagnosticsDownloaded"));
-}
-
-// ── Audio feedback ────────────────────────────────────────
-const audioNoticeEl = document.createElement("div");
-audioNoticeEl.className = "audio-notice";
-audioNoticeEl.setAttribute("role", "status");
-audioNoticeEl.setAttribute("aria-live", "polite");
-audioNoticeEl.hidden = true;
-document.body.appendChild(audioNoticeEl);
-let audioNoticeTimer = 0;
-
-function showAudioNotice(message) {
-  logAudio("notice", { message });
-  audioNoticeEl.textContent = message;
-  audioNoticeEl.hidden = false;
-  clearTimeout(audioNoticeTimer);
-  audioNoticeTimer = setTimeout(() => { audioNoticeEl.hidden = true; }, 6000);
-}
 
 function stTrackUrl(index) {
   const src = SOUNDTRACK[index]?.src ?? "";
@@ -582,65 +425,32 @@ function stTrackUrl(index) {
   return `${import.meta.env.BASE_URL}${src}`;
 }
 
-const ST_LOGGED_EVENTS = ["play", "playing", "pause", "waiting", "stalled", "ended", "error", "emptied"];
-
 function setupSTPlayer() {
-  if (stAudio) return;
-  if (!SOUNDTRACK.length) return;
+  if (stAudio || !SOUNDTRACK.length) return;
   const el = new Audio();
   el.preload = "metadata";
-  stListeners = new AbortController();
-  const { signal } = stListeners;
 
-  if (stIsEnhanced()) {
-    // Before any src: the remote file must be fetched with CORS to be routed
-    // through Web Audio (otherwise the graph outputs silence). Cached Blob
-    // URLs are same-origin and unaffected.
+  if (supportsSoundtrackGain(window)) {
+    // Must be set before src so cross-origin tracks can be routed through Web Audio.
     el.crossOrigin = "anonymous";
-    // The selected volume lives in the gain node.
     el.volume = 1;
     stGain = createSoundtrackGain({
       mediaElement: el,
       createContext: () => new (getAudioContextClass(window))(),
       volume: stVolume / 100,
       ducked: narrationDucking.snapshot().ducked,
-      onStateChange: handleSTContextState,
     });
   } else {
-    // Compatibility mode: do NOT route the element through an AudioContext.
     el.volume = stVolume / 100;
   }
 
   stAudio = el;
-  el.addEventListener("ended", handleSTEnded, { signal });
-  el.addEventListener("pause", saveState, { signal });
-  // Also covers pauses/resumes by the system (calls, other apps, headphones).
+  el.addEventListener("ended", handleSTEnded);
+  el.addEventListener("pause", saveState);
+  // Also covers system pauses/resumes (calls, headphones, other apps).
   for (const type of ["play", "pause"]) {
-    el.addEventListener(type, () => { updateSTUI(); syncMediaSession(); }, { signal });
+    el.addEventListener(type, () => { updateSTUI(); syncMediaSession(); });
   }
-  for (const type of ST_LOGGED_EVENTS) {
-    el.addEventListener(type, () => logAudio(`st:${type}`, type === "error" ? { code: el.error?.code } : undefined), { signal });
-  }
-  if (!stIsEnhanced() && narrationDucking.snapshot().ducked) duckSTNative();
-}
-
-// Releases the element, its listeners and (enhanced) its context. Disconnecting
-// the graph does not give an element its native output back, so switching
-// backends always goes through a new element.
-function teardownSTPlayer() {
-  if (!stAudio) return;
-  const el = stAudio;
-  const gain = stGain;
-  stListeners?.abort();
-  stListeners = null;
-  cancelSTFade();
-  el.pause();
-  el.removeAttribute("src");
-  el.load();
-  stAudio = null;
-  stGain = null;
-  stIsDucked = false;
-  gain?.dispose();
 }
 
 function handleSTEnded() {
@@ -651,62 +461,27 @@ function handleSTEnded() {
   syncMediaSession();
 }
 
-function handleSTContextState(contextState) {
-  logAudio("st:ctx-state", { state: contextState });
-}
-
-// Creates/resumes the context. Must run synchronously inside a user
-// interaction for iOS to let it start.
-function resumeSTContext(reason) {
+// Creates/resumes the AudioContext inside a user interaction so iOS unlocks it.
+function resumeSTContext() {
   if (!stGain || stGain.contextState === "running") return;
-  try {
-    stGain.resume().then(
-      (running) => logAudio("st:ctx-resume", { reason, running }),
-      (err) => logAudio("st:ctx-error", { reason, message: String(err?.message || err) })
-    );
-  } catch (err) {
-    logAudio("st:ctx-error", { reason, message: String(err?.message || err) });
-  }
+  stGain.resume();
 }
 
-// Any real interaction is a chance to (re)start a context that is not
-// running. Only the context is resumed; a paused element stays paused.
+// Any interaction is a chance to resume a suspended context; a paused element stays paused.
 for (const type of ["touchend", "click", "keydown"]) {
-  document.addEventListener(type, () => resumeSTContext(`gesture:${type}`), { capture: true, passive: true });
+  document.addEventListener(type, resumeSTContext, { capture: true, passive: true });
 }
 
-// Every soundtrack play() goes through here so rejections are recorded and,
-// for explicit requests, reported instead of being swallowed.
-function playST({ userInitiated = false, failureMessage } = {}) {
-  if (!stAudio) return Promise.resolve(false);
-  const el = stAudio;
-  resumeSTContext(userInitiated ? "play" : "auto-play");
-  let playing;
-  try {
-    playing = Promise.resolve(el.play());
-  } catch (err) {
-    playing = Promise.reject(err);
-  }
-  return playing.then(
-    () => {
-      // Only a playback that actually started counts as wanting the music
-      // (a rejected autoplay must not trigger "interrupted" notices later),
-      // and a pause issued meanwhile wins.
-      if (el === stAudio && !el.paused) stPlayIntent = true;
-      return true;
-    },
-    (err) => {
-      logAudio("st:play-rejected", { name: err?.name, message: err?.message, userInitiated });
-      if (el !== stAudio || err?.name === "AbortError") return false;
-      if (userInitiated) showAudioNotice(failureMessage || t("audio.musicPlayFailed"));
-      updateSTUI();
-      syncMediaSession();
-      return false;
-    }
-  );
+function playST() {
+  if (!stAudio) return;
+  resumeSTContext();
+  stAudio.play().catch(() => {
+    updateSTUI();
+    syncMediaSession();
+  });
 }
 
-// Seeks once the metadata is known (setting currentTime earlier is unreliable).
+// Seeks once metadata is known (setting currentTime earlier is unreliable).
 function seekSTWhenReady(time) {
   if (!(time > 0) || !stAudio) return;
   const el = stAudio;
@@ -714,12 +489,11 @@ function seekSTWhenReady(time) {
     try { el.currentTime = time; } catch (_) {}
   };
   if (el.readyState >= 1) apply();
-  else el.addEventListener("loadedmetadata", apply, { once: true, signal: stListeners?.signal });
+  else el.addEventListener("loadedmetadata", apply, { once: true });
 }
 
 async function loadSTTrack(index) {
   if (!stAudio || !SOUNDTRACK[index]) return;
-  const el = stAudio;
   const url = stTrackUrl(index);
 
   // Revocar objectURL anterior de este slot
@@ -736,10 +510,8 @@ async function loadSTTrack(index) {
         const blob = await cached.blob();
         const objectUrl = URL.createObjectURL(blob);
         stObjectUrls[index] = objectUrl;
-        // The element may have been replaced (mode switch) while awaiting.
-        if (el !== stAudio) return;
-        el.src = objectUrl;
-        el.load();
+        stAudio.src = objectUrl;
+        stAudio.load();
         return;
       }
     } catch (_) {}
@@ -748,9 +520,8 @@ async function loadSTTrack(index) {
   if (import.meta.env.DEV) {
     console.warn("[ST] cache miss, cargando directo desde red:", url);
   }
-  if (el !== stAudio) return;
-  el.src = url;
-  el.load();
+  stAudio.src = url;
+  stAudio.load();
 }
 
 // Source that can be assigned without awaiting the cache, so play() can still
@@ -840,8 +611,7 @@ async function downloadSTIfNeeded() {
       stCachedIds.add(SOUNDTRACK[trackIndex].id);
       localStorage.setItem("botse_audio:stCachedIds", JSON.stringify([...stCachedIds]));
 
-      // Si era la pista en reproducción, recargarla desde caché sin interrumpir.
-      // Same element, so the enhanced graph is reused.
+      // Si era la pista en reproducción, recargarla desde caché sin interrumpir
       if (trackIndex === stCurrentTrack && stAudio) {
         const wasPlaying = !stAudio.paused;
         const savedTime = stAudio.currentTime;
@@ -860,97 +630,10 @@ async function downloadSTIfNeeded() {
   return stDownloadPromise;
 }
 
-// Compatibility backend helpers (native element volume/mute).
-function setSTGain(value) {
-  if (stAudio && stCanSetVolume && !stIsEnhanced()) stAudio.volume = value;
-}
-
-function getSTGain() {
-  if (stAudio && stCanSetVolume && !stIsEnhanced()) return stAudio.volume;
-  return stVolume / 100;
-}
-
-// Ducking always ends in `muted`, never in a low volume alone: iOS discards
-// volume writes, so a volume-only duck is inaudible there. `muted` is honoured
-// on every platform and, unlike pause(), needs no user gesture to be reverted,
-// so the music returns even if the narration ends with the screen locked.
-function setSTMuted(muted) {
-  if (stAudio) stAudio.muted = muted;
-}
-
-// The fades run on a timer rather than requestAnimationFrame: rAF is frozen in
-// the background, which would strand the fade mid-way.
-const ST_FADE_STEP_MS = 50;
-
-function cancelSTFade() {
-  if (stFadeId) clearInterval(stFadeId);
-  stFadeId = 0;
-}
-
-function runSTFade(targetVol, durationMs, onDone) {
-  cancelSTFade();
-  const startVol = getSTGain();
-  const startTime = performance.now();
-  stFadeId = setInterval(() => {
-    const t = Math.min((performance.now() - startTime) / durationMs, 1);
-    setSTGain(startVol + (targetVol - startVol) * t);
-    if (t >= 1) {
-      cancelSTFade();
-      setSTGain(targetVol);
-      onDone?.();
-    }
-  }, ST_FADE_STEP_MS);
-}
-
-function duckSTNative() {
-  if (!stAudio || stIsDucked) return;
-  stIsDucked = true;
-  if (stAudio.paused || !stCanSetVolume) {
-    cancelSTFade();
-    setSTMuted(true);
-    return;
-  }
-  // Where volume works, fade down first so the cut is not abrupt. The
-  // narration is not held back waiting for it.
-  runSTFade(0, 400, () => {
-    if (!stIsDucked) return;
-    setSTMuted(true);
-    setSTGain(stVolume / 100);
-  });
-}
-
-function restoreSTNative() {
-  stIsDucked = false;
-  if (!stAudio) return;
-  const targetVol = stVolume / 100;
-  // Paused: no fade to run, just leave it unmuted and at full level so the next
-  // play is not silent.
-  if (stAudio.paused || !stCanSetVolume) {
-    cancelSTFade();
-    setSTMuted(false);
-    setSTGain(targetVol);
-    return;
-  }
-  // Fade up from silence so the music does not burst back in.
-  if (stAudio.muted) setSTGain(0);
-  setSTMuted(false);
-  if (getSTGain() >= targetVol) {
-    cancelSTFade();
-    setSTGain(targetVol);
-    return;
-  }
-  runSTFade(targetVol, 800);
-}
-
-// Applies the requested ducking to whichever backend is active.
 function applySTDuck(ducked) {
   if (!stEnabled || !stAudio) return;
-  if (stGain) {
-    stGain.setDucked(ducked);
-    return;
-  }
-  if (ducked) duckSTNative();
-  else restoreSTNative();
+  if (stGain) stGain.setDucked(ducked);
+  else stAudio.muted = ducked;
 }
 
 function updateSTUI() {
@@ -997,8 +680,7 @@ function tickSTProgress() {
 
 // Barra de música de ambiente, persistente en la zona superior (independiente de
 // la sección). Mantiene los mismos IDs que usa la lógica de audio (updateSTUI,
-// tickSTProgress, updateSTDownloadUI…). Se enlaza UNA sola vez; se vuelve a
-// renderizar al cambiar de backend (visibilidad del volumen).
+// tickSTProgress, updateSTDownloadUI…). Se renderiza y enlaza UNA sola vez.
 function renderMusicBar() {
   if (!musicBarEl) return;
   const engaged = stEnabled && stAudio;
@@ -1022,7 +704,7 @@ function renderMusicBar() {
         <input type="range" class="mb-seekbar" id="st-seekbar" min="0" max="1000" value="0" step="1" aria-label="${escapeAttribute(t("soundtrackPlayer.seek"))}">
         <span class="mb-time" id="st-total-time">-:--</span>
       </div>
-      <div class="mb-volume"${stSupportsVolumeControl() ? "" : ' hidden'}>
+      <div class="mb-volume">
         <span class="mb-vol-icon" aria-hidden="true">${ICONS.speaker}</span>
         <input type="range" class="mb-volume-slider" id="st-volume" min="0" max="100" value="${stVolume}" step="1" aria-label="${escapeAttribute(t("soundtrackPlayer.volume"))}">
       </div>
@@ -1039,10 +721,9 @@ function engageMusic() {
   stEnabled = true;
   setupSTPlayer();
   stopActivePlayer();
-  // Inside the click: lets iOS start the context before the cache lookup.
-  resumeSTContext("engage");
+  resumeSTContext();
   const start = () => {
-    playST({ userInitiated: true });
+    playST();
     syncMediaSession();
     updateSTUI();
   };
@@ -1067,22 +748,12 @@ function stPlay() {
   if (!stAudio) return;
   // Avoid playing both the soundtrack and a panel's ambient track together.
   pauseMedia(activePlayer?.ambientEl);
-  if (!stIsEnhanced()) {
-    // Compatibility mode cannot lower the soundtrack without muting it:
-    // pause an active narration so pressing music play never overlaps voice.
-    if (activePlayer?.playing) pauseNarration(activePlayer);
-    cancelSTFade();
-    stIsDucked = false;
-    setSTMuted(false);
-    setSTGain(stVolume / 100);
-  }
-  playST({ userInitiated: true });
+  playST();
   syncMediaSession();
   updateSTUI();
 }
 
 function stPause() {
-  stPlayIntent = false;
   stAudio?.pause();
   syncMediaSession();
   updateSTUI();
@@ -1123,74 +794,11 @@ function stNext() {
   });
 }
 
-// Switches between the compatibility and enhanced backends. Must be called
-// from a user interaction: the new element (and, in enhanced mode, its
-// context) has to be started by it. Track, position, volume and whether the
-// music was playing are preserved.
-function setSoundtrackMode(requested) {
-  stAudioMode = requested === SOUNDTRACK_MODES.ENHANCED ? SOUNDTRACK_MODES.ENHANCED : SOUNDTRACK_MODES.COMPAT;
-  saveState();
-  const next = resolveSTMode();
-  if (next === stActiveMode) return;
-
-  const snapshot = stAudio ? { time: stAudio.currentTime || 0, wasPlaying: !stAudio.paused } : null;
-  logAudio("st:mode-switch", { from: stActiveMode, to: next, ...snapshot });
-  teardownSTPlayer();
-  stActiveMode = next;
-  setAudioSessionType(stIsEnhanced() ? "playback" : "auto");
-
-  if (stEnabled && snapshot) {
-    setupSTPlayer();
-    if (stGain) {
-      // Created here, inside the interaction; fading in hides the moment
-      // before the seek lands.
-      stGain.ensure({ fadeInMs: RESTORE_RAMP_MS });
-    } else if (snapshot.time > 0) {
-      // Native output: stay muted until the saved position is reached.
-      const el = stAudio;
-      const unmute = () => { if (el === stAudio) el.muted = stIsDucked; };
-      el.muted = true;
-      el.addEventListener("seeked", unmute, { once: true, signal: stListeners.signal });
-      el.addEventListener("error", unmute, { once: true, signal: stListeners.signal });
-    }
-    const start = () => {
-      seekSTWhenReady(snapshot.time);
-      if (snapshot.wasPlaying) {
-        playST({ userInitiated: true, failureMessage: t("audio.modeRestartFailed") });
-      }
-      updateSTUI();
-      syncMediaSession();
-    };
-    const syncSrc = stSyncSource(stCurrentTrack);
-    if (syncSrc) {
-      // Synchronous so play() stays inside the user interaction.
-      stAudio.src = syncSrc;
-      stAudio.load();
-      start();
-    } else {
-      resumeSTContext("mode-switch");
-      loadSTTrack(stCurrentTrack).then(start);
-    }
-  }
-  renderMusicBar();
-  updateSTUI();
-  syncMediaSession();
-}
-
-// Foreground return: reconcile the context and UI without restarting music
-// the user (or the system, e.g. a call) paused, and without retry loops.
+// Foreground return: resume a suspended AudioContext and reconcile UI/ducking.
 function reconcileSTAfterWake() {
   if (!stEnabled || !stAudio) return;
-  logAudio("st:wake", { intent: stPlayIntent });
   if (stGain && stGain.isConnected && stGain.contextState !== "running") {
-    const gain = stGain;
-    gain.resume().then((running) => {
-      logAudio("st:wake-resume", { running });
-      if (!running && gain === stGain && stAudio && !stAudio.paused) showAudioNotice(t("audio.musicInterrupted"));
-    }, (err) => logAudio("st:ctx-error", { reason: "wake", message: String(err?.message || err) }));
-  } else if (stGain && stPlayIntent && stAudio.paused) {
-    // Stopped while in the background (enhanced mode): offer recovery.
-    showAudioNotice(t("audio.musicInterrupted"));
+    stGain.resume();
   }
   applySTDuck(narrationDucking.snapshot().ducked);
   updateSTUI();
@@ -1227,16 +835,8 @@ function bindMusicBarEvents() {
   musicBarEl.addEventListener("input", (event) => {
     if (event.target.id !== "st-volume") return;
     stVolume = parseInt(event.target.value, 10);
-    if (stGain) {
-      // Only the selected level changes; an active duck stays at 20% of it.
-      stGain.setVolume(stVolume / 100);
-    } else if (!(stIsDucked && stFadeId)) {
-      // A running duck fade ends muted at the new level on its own; otherwise
-      // (including a restore fade) jump to the new level. While mute-ducked it
-      // simply becomes the level heard once restored.
-      cancelSTFade();
-      setSTGain(stVolume / 100);
-    }
+    if (stGain) stGain.setVolume(stVolume / 100);
+    else if (stAudio) stAudio.volume = stVolume / 100;
     saveState();
   });
 }
@@ -1277,7 +877,6 @@ function scheduleMediaSessionRecheck() {
     const desired = desiredMediaPlaybackState();
     const ms = navigator.mediaSession;
     if (desired && ms.playbackState !== desired) {
-      logAudio("mediasession:reassert", { from: ms.playbackState, to: desired });
       try { ms.playbackState = desired; } catch {}
     }
   }, 0);
@@ -1851,18 +1450,13 @@ if (stEnabled) {
   downloadSTIfNeeded();
 }
 
-window.addEventListener("pagehide", () => {
-  saveState();
-  flushAudioDiag();
-});
+window.addEventListener("pagehide", saveState);
 
 // Hiding the page never pauses or suspends anything (iOS fires this when the
 // screen locks); coming back reconciles players the system may have stopped.
 document.addEventListener("visibilitychange", () => {
-  logAudio(document.hidden ? "page:hidden" : "page:visible");
   if (document.hidden) {
     saveState();
-    flushAudioDiag();
     return;
   }
   if (activePlayer?.playing) resyncActivePlayerAfterWake();
@@ -2050,16 +1644,6 @@ function renderSidebar() {
 
   const inicioActive = view === "inicio";
 
-  // Opt-in iOS mixing mode (plus the diagnostics export used to evaluate it).
-  const enhancedMixingHtml = stEnhancedOffered
-    ? `<label class="sidebar-ctrl-label">
-            <input type="checkbox" id="st-enhanced-checkbox" class="autoplay-checkbox"${stAudioMode === SOUNDTRACK_MODES.ENHANCED ? " checked" : ""} aria-describedby="st-enhanced-hint">
-            <span>${escapeHtml(t("sidebar.enhancedMixing"))}</span>
-          </label>
-          <p class="sidebar-section-hint" id="st-enhanced-hint">${escapeHtml(t("sidebar.enhancedMixingHint"))}</p>
-          <button type="button" class="checkable-chip" data-audio-diagnostics>${escapeHtml(t("sidebar.audioDiagnostics"))}</button>`
-    : "";
-
   return `
     <nav class="sidebar-nav" aria-label="${escapeAttribute(t("a11y.sidebarNav"))}">
       <button type="button" class="sidebar-close" data-sidebar-close aria-label="${escapeAttribute(t("a11y.closeSidebar"))}">${ICONS.close}</button>
@@ -2089,7 +1673,6 @@ function renderSidebar() {
             <span>${escapeHtml(t("sidebar.autoplay"))}</span>
           </label>
           <div class="sidebar-speed">${speedChips}</div>
-          ${enhancedMixingHtml}
         </div>
       </div>
       <div class="sidebar-divider"></div>
@@ -2132,19 +1715,6 @@ function bindConfigEvents() {
       saveState();
     });
   }
-
-  // Applied from the change event itself: the new soundtrack element (and its
-  // context) has to be started by this interaction.
-  const enhancedCheckbox = document.getElementById("st-enhanced-checkbox");
-  if (enhancedCheckbox) {
-    enhancedCheckbox.addEventListener("change", () => {
-      setSoundtrackMode(enhancedCheckbox.checked ? SOUNDTRACK_MODES.ENHANCED : SOUNDTRACK_MODES.COMPAT);
-    });
-  }
-
-  document.querySelector("[data-audio-diagnostics]")?.addEventListener("click", () => {
-    exportAudioDiagnostics();
-  });
 
   const recognizerConfirmCheckbox = document.getElementById("recognizer-confirm-card-checkbox");
   if (recognizerConfirmCheckbox) {
@@ -2392,9 +1962,8 @@ function playNarrationMedia(p, el) {
   }
   playing.catch((err) => {
     if (activePlayer !== p || seq !== p.playSeq || !p.playing) return;
-    logAudio("narration:play-rejected", { name: err?.name, message: err?.message, role: el.dataset?.role });
     if (err?.name === "AbortError" || !critical) return;
-    failNarration(p, err);
+    failNarration(p);
   });
 }
 
@@ -2459,7 +2028,7 @@ function startNarration(p) {
   // The voice is over during the ambient fade-out: nothing to duck for.
   if (p.phase !== "fade-out") narrationDucking.play(p.token);
   // An explicit play is also a chance to restart a stalled music context.
-  resumeSTContext("narration-play");
+  resumeSTContext();
   syncMediaSession();
 }
 
@@ -2478,7 +2047,7 @@ function pauseNarration(p) {
 
 // Natural end of the whole player (after the ambient fade-out, if any).
 // Idempotent: the `ended` event, the timer and the wake resync may all get here.
-function finishNarration(p, source) {
+function finishNarration(p) {
   if (!p || activePlayer !== p || p.phase === "ended") return false;
   p.playSeq++;
   stopPlayerTick(p);
@@ -2487,15 +2056,13 @@ function finishNarration(p, source) {
   p.phase = "ended";
   updatePlayerUI(p, p.totalDuration);
   setPlayerBtnState(p.playerEl, false);
-  logAudio("narration:complete", { source });
   narrationDucking.finish(p.token);
   syncMediaSession();
   return true;
 }
 
-// Rejected playback or terminal media error: stop, restore the music and tell
-// the user. A later press on play retries.
-function failNarration(p, err) {
+// Rejected playback or terminal media error: stop and restore the music.
+function failNarration(p) {
   if (!p || activePlayer !== p) return;
   p.playSeq++;
   stopPlayerTick(p);
@@ -2504,9 +2071,7 @@ function failNarration(p, err) {
   pauseMedia(p.ambientEl);
   pauseMedia(p.panelEl);
   setPlayerBtnState(p.playerEl, false);
-  if (narrationDucking.fail(p.token)) {
-    showAudioNotice(err?.name === "NotAllowedError" ? t("audio.narrationBlocked") : t("audio.narrationFailed"));
-  }
+  narrationDucking.fail(p.token);
   syncMediaSession();
 }
 
@@ -2516,7 +2081,6 @@ function failNarration(p, err) {
 function resyncActivePlayerAfterWake() {
   const p = activePlayer;
   if (!p || !p.playing) return;
-  logAudio("narration:wake");
   if (p.hasAmbient) {
     if ((p.phase === "pre-roll" || p.phase === "fade-out") && p.ambientEl?.paused) {
       playNarrationMedia(p, p.ambientEl);
@@ -2562,7 +2126,7 @@ function playerTick() {
       // Fade ambient volume down to 0 over 1 second
       if (p.ambientEl) p.ambientEl.volume = Math.max(0, AMBIENT_VOLUME * (1 - pos));
       if (pos >= 1) {
-        finishNarration(p, "tick");
+        finishNarration(p);
         return;
       }
     } else {
@@ -2572,7 +2136,7 @@ function playerTick() {
   } else {
     vt = p.panelEl.currentTime;
     if (p.panelEl.ended) {
-      finishNarration(p, "tick");
+      finishNarration(p);
       return;
     }
   }
@@ -2657,7 +2221,6 @@ function seekPlayer(vt) {
   syncMediaSession();
 }
 
-const NARRATION_LOGGED_EVENTS = ["play", "playing", "pause", "waiting", "stalled", "seeking", "seeked", "ended", "error"];
 let narrationPlayerUid = 0;
 
 // Creates the player as soon as the panel opens, before the metadata is
@@ -2720,16 +2283,12 @@ function attachPlayer(contentEl, panelEl, ambientEl) {
   panelEl.addEventListener("loadedmetadata", readDuration, { signal });
   panelEl.addEventListener("durationchange", readDuration, { signal });
 
-  for (const type of NARRATION_LOGGED_EVENTS) {
-    panelEl.addEventListener(type, () => logAudio(`narration:media-${type}`, type === "error" ? { code: panelEl.error?.code } : undefined), { signal });
-  }
-
   // Restoration is driven by the media event itself, not by the UI timer
   // (throttled while locked). No { once } so replays also trigger it.
   panelEl.addEventListener("ended", () => {
     if (activePlayer !== p) return;
     if (!hasAmbient) {
-      finishNarration(p, "ended");
+      finishNarration(p);
       return;
     }
     // Modo A: the voice is over; the ambient fades out for one more second.
@@ -2742,7 +2301,7 @@ function attachPlayer(contentEl, panelEl, ambientEl) {
   // Terminal media error while playback is requested.
   panelEl.addEventListener("error", () => {
     if (activePlayer !== p || !p.playing) return;
-    failNarration(p, panelEl.error);
+    failNarration(p);
   }, { signal });
 
   // Recover once per play request from an unexpected OS-level pause (volume
@@ -2754,7 +2313,6 @@ function attachPlayer(contentEl, panelEl, ambientEl) {
     if (activePlayer !== p || !p.playing || panelEl.ended) return;
     if (hasAmbient && p.phase !== "playing") return;
     if (p.recoveredSeq === p.playSeq) {
-      logAudio("narration:interrupted");
       pauseNarration(p);
       return;
     }

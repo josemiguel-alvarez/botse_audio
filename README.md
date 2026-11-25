@@ -4,9 +4,9 @@ Aplicación de acompañamiento para el juego de mesa **The Elder Scrolls: La tra
 
 ## Índice · Table of contents
 
-**Español** — [Qué es](#qué-es) · [Características](#características) · [Cómo instalar la app](#cómo-instalar-la-app) · [Añadir un idioma nuevo](#cómo-añadir-un-idioma-nuevo) · [Añadir contenido nuevo](#cómo-añadir-contenido-nuevo) · [Desarrollo](#desarrollo) · [Mezcla de audio en iPhone / iPad](#mezcla-de-audio-en-iphone--ipad) · [Estructura del proyecto](#estructura-del-proyecto)
+**Español** — [Qué es](#qué-es) · [Características](#características) · [Cómo instalar la app](#cómo-instalar-la-app) · [Añadir un idioma nuevo](#cómo-añadir-un-idioma-nuevo) · [Añadir contenido nuevo](#cómo-añadir-contenido-nuevo) · [Desarrollo](#desarrollo) · [Estructura del proyecto](#estructura-del-proyecto)
 
-**English** — [What it is](#what-it-is) · [Features](#features) · [Installing the app](#installing-the-app) · [Adding a new language](#adding-a-new-language) · [Adding new content](#adding-new-content) · [Development](#development) · [Audio mixing on iPhone / iPad](#audio-mixing-on-iphone--ipad) · [Project structure](#project-structure)
+**English** — [What it is](#what-it-is) · [Features](#features) · [Installing the app](#installing-the-app) · [Adding a new language](#adding-a-new-language) · [Adding new content](#adding-new-content) · [Development](#development) · [Project structure](#project-structure)
 
 ---
 
@@ -25,7 +25,6 @@ Es una aplicación web instalable (PWA): funciona en el navegador y también pue
 - ▶️ Reproducción automática (auto-play) al abrir cada texto.
 - ⏩ Velocidad de narración ajustable (de 1x a 1,5x).
 - 🎵 Banda sonora original con reproductor integrado, siempre disponible en la barra superior.
-- 🎚️ La música se silencia durante la narración; en iPhone / iPad puede, de forma experimental, bajar de volumen en su lugar (ver [Mezcla de audio en iPhone / iPad](#mezcla-de-audio-en-iphone--ipad)).
 - 🔒 Controles multimedia del sistema (pantalla de bloqueo / auriculares).
 - 🌐 Multi-idioma (de momento, Español).
 - 📥 Funciona sin conexión una vez instalada (PWA).
@@ -227,59 +226,10 @@ npm install     # instalar dependencias (solo la primera vez)
 npm run dev     # arrancar en modo desarrollo (http://localhost:5174/botse_audio/)
 npm run build   # generar la versión de producción en dist/
 npm run preview # previsualizar la versión de producción
-npm test        # comprobaciones de i18n (idiomas, claves, estructura) + pruebas de audio
-npm run test:audio # solo las pruebas de audio (node:test, sin navegador)
+npm test        # comprobaciones de i18n (idiomas, claves, estructura)
 ```
 
 > Todos los textos de la interfaz viven en los `.json` de i18n. El HTML (`index.html`) solo contiene los textos de **arranque** en español (primer pintado / sin JS); `main.js` los reemplaza por los de i18n en cuanto carga y al cambiar de idioma.
-
-## Mezcla de audio en iPhone / iPad
-
-Mientras suena una narración, la banda sonora tiene dos modos:
-
-| Situación | Modo compatible (por defecto) | Modo mejorado (experimental, opcional) |
-| --- | --- | --- |
-| Música sola | Volumen elegido | Volumen elegido |
-| Suena una narración | Música silenciada | Música al **20 % del volumen elegido** (bajada en 400 ms) |
-| Narración en pausa, detenida o terminada | Vuelve el sonido | Vuelve al volumen elegido (subida en 800 ms) |
-| Pantalla bloqueada | Reproducción nativa de siempre | La música y la narración siguen sonando (pendiente de validar en dispositivo) |
-
-- El **modo compatible** es el de siempre y sigue siendo el predeterminado, también para las instalaciones existentes.
-- El **modo mejorado** se activa en el menú lateral → *Reproducción* → **«Bajar la música durante la narración (experimental)»**. Solo aparece en iPhone / iPad (y en cualquier navegador en `npm run dev`, para probarlo en el ordenador). El resto de plataformas no cambia.
-- En modo mejorado la música pasa por Web Audio (`<audio>` → `MediaElementAudioSourceNode` → `GainNode`) con `navigator.audioSession.type = "playback"`. Se sigue transmitiendo desde el elemento `<audio>` (o desde la copia en caché): nunca se descarga y decodifica el archivo entero en memoria.
-- Cambiar de modo recrea el reproductor de música conservando pista, posición, volumen y si estaba sonando. Si no puede reanudarse, la app avisa y basta con pulsar reproducir.
-- Si la música se corta con la pantalla bloqueada en modo mejorado, vuelve al modo compatible. No hay un cambio automático y transparente en segundo plano: iOS puede exigir una nueva pulsación para volver a reproducir.
-
-### Diagnóstico
-
-La app guarda un registro de eventos de audio (estado del `AudioContext`, eventos de los elementos, posiciones y si la música debería estar bajada). Pulsa **«Copiar diagnóstico de audio»** en el menú lateral (si el portapapeles no está disponible, se descarga como archivo) o, desde la consola, `copy(botseAudioDiag.report())`. Un contexto en estado `"running"` no garantiza que se oiga algo: compruébalo siempre de oído.
-
-### Página de reproducción aislada (solo desarrollo)
-
-`dev/ios-audio.html` reproduce el mismo circuito fuera de la app, con la banda sonora y narraciones reales: música con GainNode o nativa, `audioSession` activable, pausa/parada/avance de la narración, velocidades y **10 ciclos automáticos** de narración para probar con la pantalla bloqueada. Guarda un registro con la latencia entre el final previsto de la narración y el evento `ended`.
-
-```bash
-npm run dev -- --host   # y abre http://<IP-del-ordenador>:5174/botse_audio/dev/ios-audio.html en el iPhone
-```
-
-No forma parte de la versión de producción. **Criterio de decisión:** si este circuito pierde el audio en el iPhone de prueba, no se debe activar el modo mejorado; hay que registrar el fallo y evaluar por separado la salida a través de `MediaStreamAudioDestinationNode`.
-
-### Pruebas en dispositivo (obligatorias antes de activarlo por defecto)
-
-Hazlas **sin Web Inspector conectado** (altera el comportamiento en segundo plano), anota la **versión exacta de iOS** y distingue **Safari** de la **PWA instalada**.
-
-| Escenario | Resultado esperado |
-| --- | --- |
-| Bloquear durante la música, la bajada, la narración y la recuperación | Sin silencios ni reinicios inesperados |
-| La narración termina con la pantalla bloqueada | La música vuelve al volumen elegido en **1 segundo** como máximo |
-| Diez ciclos seguidos de narración/bloqueo | Sin fallos acumulados ni música atascada en bajo |
-| Al menos 15 minutos bloqueado | La banda sonora suena sin cortes |
-| Todas las velocidades de narración, saltos, pausa/reanudar | Bajada y recuperación correctas |
-| Con caché/sin conexión y por red | Mismo comportamiento con los recursos disponibles |
-| Controles de la pantalla de bloqueo, Bluetooth e interrupciones (llamadas, otras apps) | Controles del reproductor correcto y estado recuperable |
-| Modo compatible | Se mantiene el comportamiento nativo de silencio |
-
-Las pruebas automáticas (`npm run test:audio`) cubren los objetivos de ganancia, la cancelación de rampas, las llamadas obsoletas, la recuperación según el ciclo de vida, los rechazos de `play()`, la resolución del modo y la liberación del circuito al cambiarlo, y el reparto de los controles multimedia, pero **no sustituyen** a estas pruebas en un iPhone real.
 
 ## Estructura del proyecto
 
@@ -291,8 +241,6 @@ public/
   sw.js                  service worker (offline; solo activo en producción)
 src/
   main.js                lógica de la app
-  soundtrack-gain.js     circuito Web Audio y rampas de volumen de la banda sonora (modo mejorado)
-  narration-ducking.js   ciclo de vida de la narración → bajada de la música y controles multimedia
   styles.css             estilos
   i18n.js                registro de idiomas (t(), getContent(), LANGUAGES)
   i18n/
@@ -305,9 +253,6 @@ src/
       data/              contenido narrado (ciudades, misiones, encuentros…)
 scripts/
   i18n-check.cjs         prueba que valida los idiomas (npm test)
-tests/audio/             pruebas de audio con node:test (npm run test:audio)
-dev/
-  ios-audio.html         página de reproducción aislada para iPhone (solo desarrollo)
 ```
 
 ---
@@ -328,7 +273,6 @@ It is an installable web app (PWA): it runs in the browser and can also be insta
 - ⏩ Adjustable narration speed (from 1x to 1.5x).
 - 🌲 Immersive ambient audio per scenario.
 - 🎵 Original soundtrack with a built-in player, always available in the top bar.
-- 🎚️ The music is muted during narration; on iPhone / iPad it can, experimentally, be lowered instead (see [Audio mixing on iPhone / iPad](#audio-mixing-on-iphone--ipad)).
 - 🔒 System media controls (lock screen / headphones).
 - 🌐 Multi-language (Spanish for now).
 - 📥 Works offline once installed (PWA).
@@ -530,59 +474,10 @@ npm install     # install dependencies (first time only)
 npm run dev     # start in development mode (http://localhost:5174/botse_audio/)
 npm run build   # build the production version into dist/
 npm run preview # preview the production build
-npm test        # i18n checks (languages, keys, structure) + audio tests
-npm run test:audio # audio tests only (node:test, no browser)
+npm test        # i18n checks (languages, keys, structure)
 ```
 
 > All interface texts live in the i18n `.json` files. The HTML (`index.html`) only contains the Spanish **bootstrap** texts (first paint / no-JS); `main.js` replaces them with the i18n ones as soon as it loads and whenever the language changes.
-
-## Audio mixing on iPhone / iPad
-
-While a narration plays, the soundtrack has two modes:
-
-| Situation | Compatibility mode (default) | Enhanced mode (experimental, opt-in) |
-| --- | --- | --- |
-| Music alone | Selected volume | Selected volume |
-| Narration playing | Music muted | Music at **20% of the selected volume** (400 ms ramp down) |
-| Narration paused, stopped or finished | Sound returns | Back to the selected volume (800 ms ramp up) |
-| Screen locked | Existing native playback | Music and narration keep playing (pending on-device validation) |
-
-- **Compatibility mode** is the existing behaviour and stays the default, including for existing installations.
-- **Enhanced mode** is enabled from the side menu → *Reproducción* → **“Bajar la música durante la narración (experimental)”**. It is only offered on iPhone / iPad (and on any browser under `npm run dev`, to try it on a computer). Other platforms are unchanged.
-- In enhanced mode the music goes through Web Audio (`<audio>` → `MediaElementAudioSourceNode` → `GainNode`) with `navigator.audioSession.type = "playback"`. It is still streamed by the `<audio>` element (or from the cached copy): the file is never downloaded and decoded into memory as a whole.
-- Switching modes recreates the music player, keeping the track, position, volume and whether it was playing. If it cannot resume, the app says so and pressing play is enough.
-- If the music drops out with the screen locked in enhanced mode, switch back to compatibility mode. There is no seamless automatic fallback in the background: iOS may require another tap to play again.
-
-### Diagnostics
-
-The app keeps a log of audio events (`AudioContext` state, media element events, positions and whether the music should be ducked). Press **“Copiar diagnóstico de audio”** in the side menu (if the clipboard is unavailable it is downloaded as a file) or, from the console, `copy(botseAudioDiag.report())`. A context in the `"running"` state does not guarantee audible output: always check by ear.
-
-### Isolated reproduction page (development only)
-
-`dev/ios-audio.html` reproduces the same audio path outside the app, with the real soundtrack and narrations: GainNode or native music output, toggleable `audioSession`, narration pause/stop/seek, speeds and **10 automatic narration cycles** to test with the screen locked. It logs the latency between the expected end of the narration and the `ended` event.
-
-```bash
-npm run dev -- --host   # then open http://<computer-IP>:5174/botse_audio/dev/ios-audio.html on the iPhone
-```
-
-It is not part of the production build. **Decision gate:** if this path loses audio on the target iPhone, enhanced mode must not be enabled; record the failure and evaluate output through `MediaStreamAudioDestinationNode` separately.
-
-### On-device tests (required before making it the default)
-
-Run them **without Web Inspector attached** (it alters background behaviour), record the **exact iOS version** and keep **Safari** and **installed-PWA** results apart.
-
-| Scenario | Required result |
-| --- | --- |
-| Lock during music, ducking, narration and restoration | No unintended silence or restart |
-| Narration finishes while still locked | Music returns to the selected volume within **1 second** |
-| Ten repeated narration/lock cycles | No accumulating failures or stuck ducking |
-| At least 15 minutes locked | Continuous soundtrack playback |
-| All narration speeds, seeking, pause/resume | Correct ducking and restoration |
-| Cached/offline and network playback | Same behaviour with the available assets |
-| Lock-screen controls, Bluetooth and interruptions (calls, other apps) | Correct control ownership and recoverable state |
-| Compatibility mode | Existing native mute behaviour preserved |
-
-The automated tests (`npm run test:audio`) cover gain targets, ramp cancellation, stale callbacks, lifecycle restoration, rejected `play()`, mode resolution and graph teardown on switching, and media-controls ownership, but they **do not replace** these tests on a real iPhone.
 
 ## Project structure
 
@@ -594,8 +489,6 @@ public/
   sw.js                  service worker (offline; only active in production)
 src/
   main.js                app logic
-  soundtrack-gain.js     soundtrack Web Audio graph and gain ramps (enhanced mode)
-  narration-ducking.js   narration lifecycle → music ducking and media-controls ownership
   styles.css             styles
   i18n.js                language registry (t(), getContent(), LANGUAGES)
   i18n/
@@ -608,7 +501,4 @@ src/
       data/              narrated content (cities, quests, encounters…)
 scripts/
   i18n-check.cjs         test that validates the languages (npm test)
-tests/audio/             audio tests with node:test (npm run test:audio)
-dev/
-  ios-audio.html         isolated reproduction page for iPhone (development only)
 ```

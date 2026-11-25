@@ -35,9 +35,6 @@
     "confirmRecognizedCard": "Confirmar carta",
     "ambient": "Audio ambiente",
     "soundtrackToggle": "Activar banda sonora",
-    "enhancedMixing": "Bajar la música durante la narración (experimental)",
-    "enhancedMixingHint": "En iPhone y iPad, la banda sonora baja de volumen mientras suena una narración en lugar de silenciarse. Desactívalo si la música se corta con la pantalla bloqueada.",
-    "audioDiagnostics": "Copiar diagnóstico de audio",
     "allGuilds": "Todos"
   },
   "provincias": {
@@ -104,15 +101,6 @@
     "fallbackTitle": "Soundtrack",
     "idle": "Música de ambiente",
     "barLabel": "Reproductor de música de ambiente"
-  },
-  "audio": {
-    "musicPlayFailed": "No se pudo reproducir la banda sonora. Pulsa reproducir para intentarlo de nuevo.",
-    "musicInterrupted": "La banda sonora se ha detenido. Pulsa reproducir para reanudarla.",
-    "modeRestartFailed": "No se pudo reanudar la banda sonora tras cambiar el modo. Pulsa reproducir para continuar.",
-    "narrationBlocked": "El navegador ha bloqueado la narración. Pulsa reproducir para escucharla.",
-    "narrationFailed": "No se pudo reproducir la narración. Pulsa reproducir para intentarlo de nuevo.",
-    "diagnosticsCopied": "Diagnóstico de audio copiado al portapapeles.",
-    "diagnosticsDownloaded": "Diagnóstico de audio descargado como archivo."
   },
   "spoiler": {
     "label": "Pulsa para mostrar el texto de la narración",

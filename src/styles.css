@@ -647,45 +647,6 @@ body::after {
   border-radius: var(--radius-sm);
 }
 
-/* Modo de mezcla mejorado (iOS) y exportación de diagnóstico */
-.sidebar-speed + .sidebar-ctrl-label:has(#st-enhanced-checkbox) {
-  margin-top: 10px;
-}
-
-#st-enhanced-hint {
-  margin: 0 0 8px;
-  padding-left: 0;
-}
-
-[data-audio-diagnostics] {
-  font-size: 0.9rem;
-  padding: 6px 10px;
-  border-radius: var(--radius-sm);
-}
-
-/* Aviso breve de reproducción (errores recuperables de audio) */
-.audio-notice {
-  position: fixed;
-  left: 50%;
-  bottom: calc(18px + env(safe-area-inset-bottom, 0px));
-  transform: translateX(-50%);
-  z-index: 1000;
-  max-width: min(92vw, 460px);
-  padding: 10px 16px;
-  background: var(--surface-raised);
-  color: var(--ink);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow);
-  font-size: 0.95rem;
-  line-height: 1.35;
-  text-align: center;
-}
-
-.audio-notice[hidden] {
-  display: none;
-}
-
 /* ── Sidebar overlay (mobile) ─────────────────────────────── */
 .sidebar-overlay {
   display: none;
@@ -1772,10 +1733,6 @@ button svg, [aria-hidden="true"] svg {
   min-width: 0;
   /* margen de seguridad para que el pulgar al 100% no toque el borde */
   margin-right: 6px;
-}
-
-.mb-volume[hidden] {
-  display: none;
 }
 
 .mb-vol-icon {

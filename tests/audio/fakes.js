@@ -25,36 +25,24 @@ class FakeNode {
   constructor(ctx) {
     this.ctx = ctx;
     this.outputs = [];
-    this.disconnected = false;
   }
   connect(node) {
     this.outputs.push(node);
     return node;
   }
-  disconnect() {
-    this.outputs = [];
-    this.disconnected = true;
-  }
 }
 
-const connectedElements = new WeakSet();
-
-export class FakeAudioContext extends EventTarget {
+export class FakeAudioContext {
   constructor({ state = "running", resumeResult = "running", resumeRejects = false } = {}) {
-    super();
     this.state = state;
     this.currentTime = 0;
     this.destination = new FakeNode(this);
     this.resumeResult = resumeResult;
     this.resumeRejects = resumeRejects;
     this.resumeCalls = 0;
-    this.closed = false;
     this.gains = [];
   }
   createMediaElementSource(el) {
-    // Browsers throw if an element is routed into a second source node.
-    if (connectedElements.has(el)) throw new Error("InvalidStateError: element already connected");
-    connectedElements.add(el);
     const node = new FakeNode(this);
     node.mediaElement = el;
     this.source = node;
@@ -69,15 +57,7 @@ export class FakeAudioContext extends EventTarget {
   async resume() {
     this.resumeCalls += 1;
     if (this.resumeRejects) throw new Error("NotAllowedError");
-    this.setState(this.resumeResult);
-  }
-  async close() {
-    this.closed = true;
-    this.setState("closed");
-  }
-  setState(state) {
-    this.state = state;
-    this.dispatchEvent(new Event("statechange"));
+    this.state = this.resumeResult;
   }
   advance(seconds) {
     this.currentTime += seconds;

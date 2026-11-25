@@ -5,12 +5,10 @@ import {
   DUCK_RATIO,
   DUCK_RAMP_MS,
   RESTORE_RAMP_MS,
-  SOUNDTRACK_MODES,
   computeGainTarget,
   createSoundtrackGain,
-  resolveSoundtrackMode,
   setAudioSessionType,
-  supportsEnhancedSoundtrack,
+  supportsSoundtrackGain,
 } from "../../src/soundtrack-gain.js";
 import { FakeAudioContext, fakeMediaElement } from "./fakes.js";
 
@@ -19,15 +17,13 @@ const close = (actual, expected, msg) => assert.ok(Math.abs(actual - expected) <
 function setup(options = {}) {
   const el = fakeMediaElement();
   let ctx;
-  const states = [];
   const gain = createSoundtrackGain({
     mediaElement: el,
     createContext: () => (ctx = new FakeAudioContext(options.context)),
-    onStateChange: (s) => states.push(s),
     ...options.gain,
   });
-  gain.ensure(options.ensure);
-  return { el, ctx, gain, param: ctx.gains[0].gain, states };
+  gain.ensure();
+  return { el, ctx, gain, param: ctx.gains[0].gain };
 }
 
 test("gain targets: selected volume alone, 20% of it while ducked", () => {
@@ -109,14 +105,6 @@ test("volume change mid-duck keeps the remaining ramp time", () => {
   close(at, 0.4, "ends when the original duck would have ended");
 });
 
-test("fade-in on creation starts silent and ramps to the target", () => {
-  const { param } = setup({ gain: { volume: 0.7 }, ensure: { fadeInMs: 800 } });
-  assert.deepEqual(param.calls[0], ["set", 0, 0]);
-  const [, to, at] = param.lastRamp();
-  close(to, 0.7);
-  close(at, 0.8);
-});
-
 test("changes before the graph exists are applied when it is created", () => {
   const el = fakeMediaElement();
   let ctx;
@@ -131,7 +119,6 @@ test("resume reports whether the context is actually running", async () => {
   const ok = setup({ context: { state: "suspended" } });
   assert.equal(await ok.gain.resume(), true);
   assert.equal(ok.ctx.resumeCalls, 1);
-  assert.deepEqual(ok.states, ["running"]);
   assert.equal(await ok.gain.resume(), true);
   assert.equal(ok.ctx.resumeCalls, 1, "no resume when already running");
 
@@ -142,41 +129,11 @@ test("resume reports whether the context is actually running", async () => {
   assert.equal(await rejected.gain.resume(), false);
 });
 
-test("dispose disconnects the graph and closes the context; the element cannot be reused", async () => {
-  const { el, ctx, gain, states } = setup();
-  await gain.dispose();
-  assert.equal(ctx.source.disconnected, true);
-  assert.equal(ctx.gains[0].disconnected, true);
-  assert.equal(ctx.closed, true);
-  assert.equal(gain.isConnected, false);
-  assert.deepEqual(states, [], "listener removed before close");
-  assert.equal(await gain.resume(), false);
-  assert.throws(() => gain.ensure(), /disposed/);
-  await gain.dispose();
-
-  // Switching back to native output needs a fresh element: the old one stays
-  // bound to its (closed) context.
-  const again = createSoundtrackGain({ mediaElement: el, createContext: () => new FakeAudioContext() });
-  assert.throws(() => again.ensure(), /already connected/);
-  const fresh = createSoundtrackGain({ mediaElement: fakeMediaElement(), createContext: () => new FakeAudioContext() });
-  assert.doesNotThrow(() => fresh.ensure());
-});
-
-test("mode resolution keeps compatibility mode unless enhanced is requested and usable", () => {
-  const { COMPAT, ENHANCED } = SOUNDTRACK_MODES;
-  assert.equal(resolveSoundtrackMode({}), COMPAT);
-  assert.equal(resolveSoundtrackMode({ requested: COMPAT, isIOS: true, supported: true }), COMPAT);
-  assert.equal(resolveSoundtrackMode({ requested: ENHANCED, isIOS: true, supported: true }), ENHANCED);
-  assert.equal(resolveSoundtrackMode({ requested: ENHANCED, isIOS: true, supported: false }), COMPAT);
-  assert.equal(resolveSoundtrackMode({ requested: ENHANCED, isIOS: false, supported: true }), COMPAT, "other platforms unchanged");
-  assert.equal(resolveSoundtrackMode({ requested: ENHANCED, isIOS: false, allowAnyPlatform: true, supported: true }), ENHANCED);
-});
-
 test("feature detection and audio session type", () => {
   class Ctx { createMediaElementSource() {} createGain() {} }
-  assert.equal(supportsEnhancedSoundtrack({ AudioContext: Ctx }), true);
-  assert.equal(supportsEnhancedSoundtrack({ webkitAudioContext: Ctx }), true);
-  assert.equal(supportsEnhancedSoundtrack({}), false);
+  assert.equal(supportsSoundtrackGain({ AudioContext: Ctx }), true);
+  assert.equal(supportsSoundtrackGain({ webkitAudioContext: Ctx }), true);
+  assert.equal(supportsSoundtrackGain({}), false);
 
   const nav = { audioSession: { type: "auto" } };
   assert.equal(setAudioSessionType("playback", nav), true);
@@ -184,11 +141,4 @@ test("feature detection and audio session type", () => {
   assert.equal(setAudioSessionType("playback", {}), false, "API missing");
   const throwing = { audioSession: { set type(_) { throw new Error("nope"); }, get type() { return "auto"; } } };
   assert.equal(setAudioSessionType("playback", throwing), false);
-});
-
-test("dispose while a resume is pending resolves false instead of throwing", async () => {
-  const { gain } = setup({ context: { state: "suspended" } });
-  const pending = gain.resume();
-  gain.dispose();
-  assert.equal(await pending, false);
 });
