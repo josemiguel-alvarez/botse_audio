@@ -29,6 +29,11 @@ export function getAudioContextClass(scope = globalThis) {
   return scope?.AudioContext || scope?.webkitAudioContext || null;
 }
 
+export function isIOSDevice(nav = globalThis.navigator) {
+  const ua = nav?.userAgent || "";
+  return /iPad|iPhone|iPod/.test(ua) || (/Macintosh/.test(ua) && (nav?.maxTouchPoints ?? 0) > 1);
+}
+
 export function supportsSoundtrackGain(scope = globalThis) {
   const Ctx = getAudioContextClass(scope);
   const proto = Ctx?.prototype;

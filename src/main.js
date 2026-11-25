@@ -5,6 +5,7 @@ import CardScanner, { CROP } from "./card-scanner.js";
 import {
   createSoundtrackGain,
   getAudioContextClass,
+  isIOSDevice,
   setAudioSessionType,
   supportsSoundtrackGain,
 } from "./soundtrack-gain.js";
@@ -192,7 +193,7 @@ let gremioCollapsed = typeof state.gremioCollapsed === "boolean" ? state.gremioC
 let narrationsCollapsed = typeof state.narrationsCollapsed === "boolean" ? state.narrationsCollapsed : false;
 let bandaCollapsed = typeof state.bandaCollapsed === "boolean" ? state.bandaCollapsed : false;
 
-/** @type {null | { tickId: number, panelEl: HTMLAudioElement, ambientEl: HTMLAudioElement|null, hasAmbient: boolean, totalDuration: number, playerEl: HTMLElement, isSeeking: boolean }} */
+/** @type {null | { rafId: number, panelEl: HTMLAudioElement, ambientEl: HTMLAudioElement|null, hasAmbient: boolean, totalDuration: number, playerEl: HTMLElement, isSeeking: boolean }} */
 let activePlayer = null;
 
 let contentTree = buildTreeFromStart();
@@ -387,16 +388,21 @@ const stCachedIds = new Set(JSON.parse(localStorage.getItem("botse_audio:stCache
 
 /** @type {HTMLAudioElement | null} */
 let stAudio = null;
+/** @type {AudioContext | null} */
+let stAudioCtx = null;
+/** @type {GainNode | null} */
+let stGainNode = null;
+// iOS/iPadOS audio workarounds (all other platforms stay on the original path).
+const isIOS = isIOSDevice(navigator);
 /** @type {ReturnType<typeof createSoundtrackGain> | null} */
 let stGain = null;
-
-// Must be set before any audio starts so iOS lets Web Audio keep playing on lock.
-if (supportsSoundtrackGain(window)) setAudioSessionType("playback");
+if (isIOS && supportsSoundtrackGain(window)) setAudioSessionType("playback");
 
 let stCurrentTrack = (typeof state.stCurrentTrack === "number" && state.stCurrentTrack >= 0 && state.stCurrentTrack < SOUNDTRACK.length) ? state.stCurrentTrack : 0;
 let stVolume = (typeof state.stVolume === "number" && state.stVolume >= 0 && state.stVolume <= 100) ? state.stVolume : 100;
 let stRestoreTime = (typeof state.stCurrentTime === "number" && state.stCurrentTime > 0) ? state.stCurrentTime : 0;
 let stSaveTickCount = 0;
+let stIsDucked = false;
 let stPollId = null;
 let stIsSeeking = false;
 let stIsDownloading = false;
@@ -404,13 +410,59 @@ let stIsDownloading = false;
 let stDownloadPromise = null;
 const stObjectUrls = {}; // index → objectURL (para revocar al cambiar pista)
 
-// Narration lifecycle → requested ducking + lock-screen ownership.
-const narrationDucking = createNarrationDucking({
-  onChange: (snap) => {
-    applySTDuck(snap.ducked);
-    syncMediaSession();
-  },
-});
+const narrationDucking = isIOS
+  ? createNarrationDucking({
+      onChange: (snap) => {
+        applyIOSDuck(snap.ducked);
+        syncIOSMediaSession();
+      },
+    })
+  : null;
+
+function applyIOSDuck(ducked) {
+  if (!stEnabled || !stAudio) return;
+  if (stGain) stGain.setDucked(ducked);
+  else stAudio.muted = ducked;
+}
+
+function resumeSTContext() {
+  if (!stGain || stGain.contextState === "running") return;
+  stGain.resume();
+}
+
+if (isIOS) {
+  // Any user interaction is a chance to unlock/resume the iOS AudioContext.
+  for (const type of ["touchend", "click", "keydown"]) {
+    document.addEventListener(type, resumeSTContext, { capture: true, passive: true });
+  }
+}
+
+function playSTIOS() {
+  if (!stAudio) return;
+  resumeSTContext();
+  stAudio.play().catch(() => {
+    updateSTUI();
+    syncIOSMediaSession();
+  });
+}
+
+function seekSTWhenReady(time) {
+  if (!(time > 0) || !stAudio) return;
+  const el = stAudio;
+  const apply = () => {
+    try { el.currentTime = time; } catch (_) {}
+  };
+  if (el.readyState >= 1) apply();
+  else el.addEventListener("loadedmetadata", apply, { once: true });
+}
+
+// Returns a URL synchronously when not in Cache API so iOS keeps play() in the tap gesture.
+function stSyncSource(index) {
+  if (stObjectUrls[index]) return stObjectUrls[index];
+  const track = SOUNDTRACK[index];
+  if (!track || stCachedIds.has(track.id)) return null;
+  return stTrackUrl(index);
+}
 
 function stTrackUrl(index) {
   const src = SOUNDTRACK[index]?.src ?? "";
@@ -426,70 +478,56 @@ function stTrackUrl(index) {
 }
 
 function setupSTPlayer() {
-  if (stAudio || !SOUNDTRACK.length) return;
-  const el = new Audio();
-  el.preload = "metadata";
-
-  if (supportsSoundtrackGain(window)) {
-    // Must be set before src so cross-origin tracks can be routed through Web Audio.
-    el.crossOrigin = "anonymous";
-    el.volume = 1;
-    stGain = createSoundtrackGain({
-      mediaElement: el,
-      createContext: () => new (getAudioContextClass(window))(),
-      volume: stVolume / 100,
-      ducked: narrationDucking.snapshot().ducked,
+  if (stAudio) return;
+  if (!SOUNDTRACK.length) return;
+  stAudio = new Audio();
+  stAudio.preload = "metadata";
+  if (isIOS) {
+    if (supportsSoundtrackGain(window)) {
+      // Required before src so cross-origin tracks can be routed through Web Audio on iOS.
+      stAudio.crossOrigin = "anonymous";
+      stAudio.volume = 1;
+      stGain = createSoundtrackGain({
+        mediaElement: stAudio,
+        createContext: () => new (getAudioContextClass(window))(),
+        volume: stVolume / 100,
+        ducked: narrationDucking.snapshot().ducked,
+      });
+    } else {
+      stAudio.volume = stVolume / 100;
+    }
+    stAudio.addEventListener("ended", () => {
+      stCurrentTrack = (stCurrentTrack + 1) % SOUNDTRACK.length;
+      loadSTTrack(stCurrentTrack).then(() => playSTIOS());
+      updateSTUI();
+      saveState();
+      syncIOSMediaSession();
     });
-  } else {
-    el.volume = stVolume / 100;
+    stAudio.addEventListener("pause", saveState);
+    for (const type of ["play", "pause"]) {
+      stAudio.addEventListener(type, () => { updateSTUI(); syncIOSMediaSession(); });
+    }
+    return;
   }
-
-  stAudio = el;
-  el.addEventListener("ended", handleSTEnded);
-  el.addEventListener("pause", saveState);
-  // Also covers system pauses/resumes (calls, headphones, other apps).
-  for (const type of ["play", "pause"]) {
-    el.addEventListener(type, () => { updateSTUI(); syncMediaSession(); });
+  try {
+    stAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    stGainNode = stAudioCtx.createGain();
+    stAudioCtx.createMediaElementSource(stAudio).connect(stGainNode);
+    stGainNode.connect(stAudioCtx.destination);
+    stGainNode.gain.value = stVolume / 100;
+  } catch (_) {
+    stAudio.volume = stVolume / 100;
   }
-}
-
-function handleSTEnded() {
-  stCurrentTrack = (stCurrentTrack + 1) % SOUNDTRACK.length;
-  loadSTTrack(stCurrentTrack).then(() => playST());
-  updateSTUI();
-  saveState();
-  syncMediaSession();
-}
-
-// Creates/resumes the AudioContext inside a user interaction so iOS unlocks it.
-function resumeSTContext() {
-  if (!stGain || stGain.contextState === "running") return;
-  stGain.resume();
-}
-
-// Any interaction is a chance to resume a suspended context; a paused element stays paused.
-for (const type of ["touchend", "click", "keydown"]) {
-  document.addEventListener(type, resumeSTContext, { capture: true, passive: true });
-}
-
-function playST() {
-  if (!stAudio) return;
-  resumeSTContext();
-  stAudio.play().catch(() => {
+  stAudio.addEventListener("ended", () => {
+    stCurrentTrack = (stCurrentTrack + 1) % SOUNDTRACK.length;
+    loadSTTrack(stCurrentTrack).then(() => {
+      stAudio.play().catch(() => {});
+    });
     updateSTUI();
-    syncMediaSession();
+    saveState();
+    updateSTMediaSession(true);
   });
-}
-
-// Seeks once metadata is known (setting currentTime earlier is unreliable).
-function seekSTWhenReady(time) {
-  if (!(time > 0) || !stAudio) return;
-  const el = stAudio;
-  const apply = () => {
-    try { el.currentTime = time; } catch (_) {}
-  };
-  if (el.readyState >= 1) apply();
-  else el.addEventListener("loadedmetadata", apply, { once: true });
+  stAudio.addEventListener("pause", saveState);
 }
 
 async function loadSTTrack(index) {
@@ -522,15 +560,6 @@ async function loadSTTrack(index) {
   }
   stAudio.src = url;
   stAudio.load();
-}
-
-// Source that can be assigned without awaiting the cache, so play() can still
-// happen inside the user interaction. null when only the cache can provide it.
-function stSyncSource(index) {
-  if (stObjectUrls[index]) return stObjectUrls[index];
-  const track = SOUNDTRACK[index];
-  if (!track || stCachedIds.has(track.id)) return null;
-  return stTrackUrl(index);
 }
 
 function updateSTDownloadUI(progress) {
@@ -616,8 +645,13 @@ async function downloadSTIfNeeded() {
         const wasPlaying = !stAudio.paused;
         const savedTime = stAudio.currentTime;
         await loadSTTrack(trackIndex);
-        seekSTWhenReady(savedTime);
-        if (wasPlaying) playST();
+        if (isIOS) {
+          seekSTWhenReady(savedTime);
+          if (wasPlaying) playSTIOS();
+        } else {
+          stAudio.currentTime = savedTime;
+          if (wasPlaying) stAudio.play().catch(() => {});
+        }
       }
     } catch (err) {
       console.warn("Soundtrack download failed:", url, err);
@@ -630,10 +664,82 @@ async function downloadSTIfNeeded() {
   return stDownloadPromise;
 }
 
-function applySTDuck(ducked) {
-  if (!stEnabled || !stAudio) return;
-  if (stGain) stGain.setDucked(ducked);
-  else stAudio.muted = ducked;
+function setSTGain(value) {
+  if (stGainNode) stGainNode.gain.value = value;
+  else if (stAudio) stAudio.volume = value;
+}
+
+function getSTGain() {
+  if (stGainNode) return stGainNode.gain.value;
+  if (stAudio) return stAudio.volume;
+  return stVolume / 100;
+}
+
+function duckST() {
+  if (stEnabled && stAudio) {
+    stIsDucked = true;
+    setSTGain(Math.min(stVolume, 20) / 100);
+  }
+}
+
+function duckSTFade(onDone) {
+  const targetVol = Math.min(stVolume, 20) / 100;
+  if (!stEnabled || !stAudio || stAudio.paused) {
+    onDone();
+    return;
+  }
+  stIsDucked = true;
+  if (getSTGain() <= targetVol) {
+    setSTGain(targetVol);
+    setTimeout(onDone, 300);
+    return;
+  }
+  const startVol = getSTGain();
+  const startTime = performance.now();
+  const FADE_MS = 500;
+  function step() {
+    const t = Math.min((performance.now() - startTime) / FADE_MS, 1);
+    setSTGain(startVol + (targetVol - startVol) * t);
+    if (t < 1) {
+      requestAnimationFrame(step);
+    } else {
+      onDone();
+    }
+  }
+  requestAnimationFrame(step);
+}
+
+function restoreST() {
+  if (stEnabled && stAudio) {
+    stIsDucked = false;
+    setSTGain(stVolume / 100);
+    if (!stAudio.paused) updateSTMediaSession(true);
+  }
+}
+
+function restoreSTFade() {
+  stIsDucked = false;
+  if (!stEnabled || !stAudio || stAudio.paused) return;
+  const targetVol = stVolume / 100;
+  if (getSTGain() >= targetVol) {
+    setSTGain(targetVol);
+    updateSTMediaSession(true);
+    return;
+  }
+  const startVol = getSTGain();
+  const startTime = performance.now();
+  const FADE_MS = 800;
+  function step() {
+    const t = Math.min((performance.now() - startTime) / FADE_MS, 1);
+    setSTGain(startVol + (targetVol - startVol) * t);
+    if (t < 1) {
+      requestAnimationFrame(step);
+    } else {
+      setSTGain(targetVol);
+      if (!stAudio.paused) updateSTMediaSession(true);
+    }
+  }
+  requestAnimationFrame(step);
 }
 
 function updateSTUI() {
@@ -720,48 +826,73 @@ function renderMusicBar() {
 function engageMusic() {
   stEnabled = true;
   setupSTPlayer();
-  stopActivePlayer();
-  resumeSTContext();
-  const start = () => {
-    playST();
-    syncMediaSession();
-    updateSTUI();
-  };
-  const syncSrc = stSyncSource(stCurrentTrack);
-  if (syncSrc) {
-    // Synchronous so play() stays inside the user interaction on iOS.
-    stAudio.src = syncSrc;
-    stAudio.load();
-    start();
-  } else {
-    loadSTTrack(stCurrentTrack).then(start);
+  if (isIOS) {
+    stopActivePlayer();
+    resumeSTContext();
+    const start = () => {
+      playSTIOS();
+      syncIOSMediaSession();
+      updateSTUI();
+    };
+    const syncSrc = stSyncSource(stCurrentTrack);
+    if (syncSrc) {
+      stAudio.src = syncSrc;
+      stAudio.load();
+      start();
+    } else {
+      loadSTTrack(stCurrentTrack).then(start);
+    }
+    downloadSTIfNeeded();
+    renderMusicBar();
+    saveState();
+    render();
+    setTimeout(updateSTUI, 200);
+    return;
   }
+  loadSTTrack(stCurrentTrack).then(() => {
+    stAudioCtx?.resume();
+    stAudio?.play().catch(() => {});
+    updateSTMediaSession(true);
+    updateSTUI();
+  });
   downloadSTIfNeeded();
+  stopActivePlayer();
   renderMusicBar();
   saveState();
   render(); // refresca el sidebar (el ajuste de audio ambiente puede haber cambiado)
   setTimeout(updateSTUI, 200);
 }
 
-// Explicit request for music (button or lock screen).
-function stPlay() {
+function stPlayIOS() {
   if (!stAudio) return;
   // Avoid playing both the soundtrack and a panel's ambient track together.
   pauseMedia(activePlayer?.ambientEl);
-  playST();
-  syncMediaSession();
+  playSTIOS();
+  syncIOSMediaSession();
   updateSTUI();
 }
 
-function stPause() {
+function stPauseIOS() {
   stAudio?.pause();
-  syncMediaSession();
+  syncIOSMediaSession();
   updateSTUI();
 }
 
 function stPlayPause() {
   if (!stEnabled || !stAudio) { engageMusic(); return; }
-  if (stAudio.paused) stPlay(); else stPause();
+  if (isIOS) {
+    if (stAudio.paused) stPlayIOS(); else stPauseIOS();
+    return;
+  }
+  if (stAudio.paused) {
+    stAudioCtx?.resume();
+    stAudio.play().catch(() => {});
+    updateSTMediaSession(true);
+  } else {
+    stAudio.pause();
+    updateSTMediaSession(false);
+  }
+  updateSTUI();
 }
 
 function stPrev() {
@@ -770,14 +901,19 @@ function stPrev() {
   if (stAudio.currentTime > 3) {
     stAudio.currentTime = 0;
     updateSTUI();
-    syncMediaSession();
+    if (isIOS) syncIOSMediaSession();
+    else if (wasPlaying) updateSTMediaSession(true);
   } else {
     stCurrentTrack = (stCurrentTrack - 1 + SOUNDTRACK.length) % SOUNDTRACK.length;
     loadSTTrack(stCurrentTrack).then(() => {
-      if (wasPlaying) playST();
+      if (wasPlaying) {
+        if (isIOS) playSTIOS();
+        else stAudio.play().catch(() => {});
+      }
       updateSTUI();
       saveState();
-      syncMediaSession();
+      if (isIOS) syncIOSMediaSession();
+      else if (wasPlaying) updateSTMediaSession(true);
     });
   }
 }
@@ -787,22 +923,25 @@ function stNext() {
   const wasPlaying = !stAudio.paused;
   stCurrentTrack = (stCurrentTrack + 1) % SOUNDTRACK.length;
   loadSTTrack(stCurrentTrack).then(() => {
-    if (wasPlaying) playST();
+    if (wasPlaying) {
+      if (isIOS) playSTIOS();
+      else stAudio.play().catch(() => {});
+    }
     updateSTUI();
     saveState();
-    syncMediaSession();
+    if (isIOS) syncIOSMediaSession();
+    else if (wasPlaying) updateSTMediaSession(true);
   });
 }
 
-// Foreground return: resume a suspended AudioContext and reconcile UI/ducking.
 function reconcileSTAfterWake() {
   if (!stEnabled || !stAudio) return;
   if (stGain && stGain.isConnected && stGain.contextState !== "running") {
     stGain.resume();
   }
-  applySTDuck(narrationDucking.snapshot().ducked);
+  applyIOSDuck(narrationDucking.snapshot().ducked);
   updateSTUI();
-  syncMediaSession();
+  syncIOSMediaSession();
 }
 
 // Eventos de la barra de música. Delegación sobre el contenedor persistente:
@@ -836,45 +975,27 @@ function bindMusicBarEvents() {
     if (event.target.id !== "st-volume") return;
     stVolume = parseInt(event.target.value, 10);
     if (stGain) stGain.setVolume(stVolume / 100);
-    else if (stAudio) stAudio.volume = stVolume / 100;
+    else setSTGain((stIsDucked ? Math.min(stVolume, 30) : stVolume) / 100);
     saveState();
   });
 }
 
-// ── Media Session (lock screen / headphones) ──────────────
-// A single owner at a time: the open narration, or else the music.
-let mediaSessionKey = "";
+// ── iOS Media Session (single owner + WebKit playbackState re-assertion) ──
+let iosMediaSessionKey = "";
+let iosMediaSessionRecheckId = 0;
 
-function stMediaMetadata() {
-  const base = import.meta.env.BASE_URL;
-  return new MediaMetadata({
-    title: SOUNDTRACK[stCurrentTrack]?.title ?? t("soundtrackPlayer.fallbackTitle"),
-    artist: t("app.mediaArtist"),
-    artwork: [
-      { src: `${base}icons/icon-192.png`, sizes: "192x192", type: "image/png" },
-      { src: `${base}icons/icon-512.png`, sizes: "512x512", type: "image/png" },
-    ]
-  });
-}
-
-// Lock-screen state the app wants, or null when nothing owns the controls.
-function desiredMediaPlaybackState() {
+function desiredIOSMediaPlaybackState() {
   const { owner } = narrationDucking.snapshot();
   if (owner === "narration" && activePlayer) return activePlayer.playing ? "playing" : "paused";
   if (stEnabled && stAudio && SOUNDTRACK.length) return stAudio.paused ? "paused" : "playing";
   return null;
 }
 
-// WebKit also rewrites playbackState to "paused" asynchronously after a
-// media element pauses (e.g. the narration that just handed the controls back
-// to the music), so the state is re-asserted once after the current task.
-let mediaSessionRecheckId = 0;
-
-function scheduleMediaSessionRecheck() {
-  if (mediaSessionRecheckId) return;
-  mediaSessionRecheckId = setTimeout(() => {
-    mediaSessionRecheckId = 0;
-    const desired = desiredMediaPlaybackState();
+function scheduleIOSMediaSessionRecheck() {
+  if (iosMediaSessionRecheckId) return;
+  iosMediaSessionRecheckId = setTimeout(() => {
+    iosMediaSessionRecheckId = 0;
+    const desired = desiredIOSMediaPlaybackState();
     const ms = navigator.mediaSession;
     if (desired && ms.playbackState !== desired) {
       try { ms.playbackState = desired; } catch {}
@@ -882,44 +1003,105 @@ function scheduleMediaSessionRecheck() {
   }, 0);
 }
 
-function syncMediaSession() {
-  if (!("mediaSession" in navigator)) return;
+function syncIOSMediaSession() {
+  if (!isIOS || !("mediaSession" in navigator)) return;
   const ms = navigator.mediaSession;
   const { owner } = narrationDucking.snapshot();
   const p = activePlayer;
-  const playbackState = desiredMediaPlaybackState();
+  const playbackState = desiredIOSMediaPlaybackState();
 
   if (owner === "narration" && p) {
     const key = `narration:${p.uid}`;
     applyMediaSessionControls(ms, {
-      metadata: key === mediaSessionKey ? undefined : p.mediaMetadata,
+      metadata: key === iosMediaSessionKey ? undefined : p.mediaMetadata,
       playbackState,
       handlers: {
-        play: () => startNarration(activePlayer),
-        pause: () => pauseNarration(activePlayer),
+        play: () => startIOSNarration(activePlayer),
+        pause: () => pauseIOSNarration(activePlayer),
         stop: () => stopActivePlayer(),
       },
     });
-    mediaSessionKey = key;
+    iosMediaSessionKey = key;
   } else if (playbackState) {
     const key = `music:${stCurrentTrack}`;
+    const base = import.meta.env.BASE_URL;
     applyMediaSessionControls(ms, {
-      metadata: key === mediaSessionKey ? undefined : stMediaMetadata(),
+      metadata: key === iosMediaSessionKey ? undefined : new MediaMetadata({
+        title: SOUNDTRACK[stCurrentTrack]?.title ?? t("soundtrackPlayer.fallbackTitle"),
+        artist: t("app.mediaArtist"),
+        artwork: [
+          { src: `${base}icons/icon-192.png`, sizes: "192x192", type: "image/png" },
+          { src: `${base}icons/icon-512.png`, sizes: "512x512", type: "image/png" },
+        ],
+      }),
       playbackState,
       handlers: {
-        play: stPlay,
-        pause: stPause,
+        play: stPlayIOS,
+        pause: stPauseIOS,
         previoustrack: stPrev,
         nexttrack: stNext,
       },
     });
-    mediaSessionKey = key;
+    iosMediaSessionKey = key;
   } else {
     applyMediaSessionControls(ms, { metadata: null, playbackState: "none" });
-    mediaSessionKey = "";
+    iosMediaSessionKey = "";
     return;
   }
-  scheduleMediaSessionRecheck();
+  scheduleIOSMediaSessionRecheck();
+}
+
+function updateSTMediaSession(playing) {
+  if (!("mediaSession" in navigator) || !SOUNDTRACK.length) return;
+  const base = import.meta.env.BASE_URL;
+  if (playing) {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: SOUNDTRACK[stCurrentTrack]?.title ?? t("soundtrackPlayer.fallbackTitle"),
+      artist: t("app.mediaArtist"),
+      artwork: [
+        { src: `${base}icons/icon-192.png`, sizes: "192x192", type: "image/png" },
+        { src: `${base}icons/icon-512.png`, sizes: "512x512", type: "image/png" },
+      ]
+    });
+    navigator.mediaSession.setActionHandler("play", () => {
+      stAudio?.play().catch(() => {});
+      updateSTUI();
+      updateSTMediaSession(true);
+    });
+    navigator.mediaSession.setActionHandler("pause", () => {
+      stAudio?.pause();
+      stopSTPoll();
+      updateSTUI();
+      navigator.mediaSession.playbackState = "paused";
+    });
+    navigator.mediaSession.setActionHandler("previoustrack", () => {
+      if (!stAudio) return;
+      const wasPlaying = !stAudio.paused;
+      if (stAudio.currentTime > 3) {
+        stAudio.currentTime = 0;
+        updateSTUI();
+        updateSTMediaSession(true);
+      } else {
+        stCurrentTrack = (stCurrentTrack - 1 + SOUNDTRACK.length) % SOUNDTRACK.length;
+        loadSTTrack(stCurrentTrack).then(() => {
+          if (wasPlaying) stAudio.play().catch(() => {});
+          updateSTUI();
+          updateSTMediaSession(true);
+        });
+      }
+    });
+    navigator.mediaSession.setActionHandler("nexttrack", () => {
+      if (!stAudio) return;
+      const wasPlaying = !stAudio.paused;
+      stCurrentTrack = (stCurrentTrack + 1) % SOUNDTRACK.length;
+      loadSTTrack(stCurrentTrack).then(() => {
+        if (wasPlaying) stAudio.play().catch(() => {});
+        updateSTUI();
+        updateSTMediaSession(true);
+      });
+    });
+  }
+  navigator.mediaSession.playbackState = playing ? "playing" : "paused";
 }
 
 // Barra de música de ambiente (persistente en la zona superior).
@@ -1439,28 +1621,51 @@ document.addEventListener("keydown", (e) => {
 if (stEnabled) {
   setupSTPlayer();
   loadSTTrack(stCurrentTrack).then(() => {
-    seekSTWhenReady(stRestoreTime);
-    stRestoreTime = 0;
-    // Usually rejected without a user interaction (iOS); the play button or
-    // the lock screen starts it then.
-    playST();
+    if (isIOS) {
+      seekSTWhenReady(stRestoreTime);
+      stRestoreTime = 0;
+      playSTIOS();
+      updateSTUI();
+      syncIOSMediaSession();
+      return;
+    }
+    if (stRestoreTime > 0) {
+      if (isFinite(stAudio.duration) && stAudio.duration > 0) {
+        stAudio.currentTime = stRestoreTime;
+        stRestoreTime = 0;
+      } else {
+        const seekOnce = () => {
+          stAudio.currentTime = stRestoreTime;
+          stRestoreTime = 0;
+          stAudio.removeEventListener("loadedmetadata", seekOnce);
+        };
+        stAudio.addEventListener("loadedmetadata", seekOnce);
+      }
+    }
+    stAudio?.play().catch(() => {});
     updateSTUI();
-    syncMediaSession();
+    updateSTMediaSession(true);
   });
   downloadSTIfNeeded();
 }
 
-window.addEventListener("pagehide", saveState);
+window.addEventListener("pagehide", () => {
+  saveState();
+});
 
-// Hiding the page never pauses or suspends anything (iOS fires this when the
-// screen locks); coming back reconciles players the system may have stopped.
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     saveState();
     return;
   }
-  if (activePlayer?.playing) resyncActivePlayerAfterWake();
-  reconcileSTAfterWake();
+  if (isIOS) {
+    if (activePlayer?.playing) resyncIOSPlayerAfterWake();
+    reconcileSTAfterWake();
+  }
+});
+
+window.addEventListener("pagehide", (e) => {
+  if (!isIOS && !e.persisted && activePlayer?.playing) pauseActivePlayerInternal();
 });
 
 function registerServiceWorker() {
@@ -1902,54 +2107,28 @@ function formatTimeLong(secs) {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-// WebKit sets mediaSession.playbackState to "paused" on every pause() call,
-// even on an element that is already paused, which would overwrite the state
-// just handed back to the music. Only pause what is actually playing.
+// Ambient beds (ambient/general.mp3) are pre-attenuated by -12 dB so native
+// <audio> sits softly behind narrations on iOS (where .volume is ignored) while
+// matching the previous 0.25 level on other platforms.
+const AMBIENT_VOLUME = 1;
+const IOS_PLAYER_TICK_MS = 200;
+
 function pauseMedia(el) {
   if (el && !el.paused) el.pause();
 }
 
-function stopActivePlayer() {
-  if (!activePlayer) return;
-  const p = activePlayer;
-  activePlayer = null;
-  p.playSeq++;
-  p.playing = false;
-  p.listeners.abort();
-  stopPlayerTick(p);
-  pauseMedia(p.panelEl);
-  pauseMedia(p.ambientEl);
-  // Restores the music and hands the lock-screen controls back to it.
-  narrationDucking.detach(p.token);
+function schedulePlayerLoop() {
+  return isIOS ? setTimeout(playerRaf, IOS_PLAYER_TICK_MS) : requestAnimationFrame(playerRaf);
 }
 
-// The player loop uses a timer, not requestAnimationFrame: rAF is frozen while
-// the screen is locked or the tab is in the background, which left the state
-// machine (pre-roll → narration → fade-out) stuck halfway. It only drives the
-// UI and the ambient pre-roll/fade-out; ducking restoration relies on media
-// events instead.
-const PLAYER_TICK_MS = 200;
-
-function startPlayerTick(p) {
-  if (!p || p.tickId) return;
-  p.tickId = setInterval(playerTick, PLAYER_TICK_MS);
+function cancelPlayerLoop(p) {
+  if (!p || !p.rafId) return;
+  if (isIOS) clearTimeout(p.rafId);
+  else cancelAnimationFrame(p.rafId);
+  p.rafId = 0;
 }
 
-function stopPlayerTick(p) {
-  if (!p) return;
-  if (p.tickId) clearInterval(p.tickId);
-  p.tickId = 0;
-}
-
-// Ambient beds (e.g. ambient/general.mp3) are pre-attenuated by -12 dB so
-// native <audio> plays softly behind narrations even on iOS, where
-// HTMLMediaElement.volume is ignored.
-const AMBIENT_VOLUME = 1;
-
-// Every narration play() goes through here. A rejection only counts if it
-// belongs to the current player and the current start request, so a late
-// promise from an older narration (or one superseded by a pause) is ignored.
-function playNarrationMedia(p, el) {
+function playIOSNarrationMedia(p, el) {
   if (!el) return;
   if (el === p.ambientEl && stAudio && !stAudio.paused) return;
   const seq = p.playSeq;
@@ -1963,12 +2142,11 @@ function playNarrationMedia(p, el) {
   playing.catch((err) => {
     if (activePlayer !== p || seq !== p.playSeq || !p.playing) return;
     if (err?.name === "AbortError" || !critical) return;
-    failNarration(p);
+    failIOSNarration(p);
   });
 }
 
-// Folds the running pre-roll/fade-out clock into its accumulated position.
-function holdNarrationClock(p) {
+function holdIOSNarrationClock(p) {
   if (!p.hasAmbient || p.phaseStartMs == null) return;
   if (p.phase === "pre-roll") {
     const elapsed = (performance.now() - p.phaseStartMs) / 1000 / p.panelEl.playbackRate;
@@ -1980,17 +2158,7 @@ function holdNarrationClock(p) {
   p.phaseStartMs = null;
 }
 
-function enterFadeOut(p) {
-  p.phase = "fade-out";
-  p.fadeOutPosAtStart = 0;
-  p.phaseStartMs = performance.now();
-  if (p.ambientEl) p.ambientEl.volume = AMBIENT_VOLUME;
-}
-
-// Start, resume or replay. Called synchronously from the interaction (panel
-// open, play button, lock screen) so iOS accepts play(); the music is ducked
-// at the same time rather than before.
-function startNarration(p) {
+function startIOSNarration(p) {
   if (!p || activePlayer !== p || p.playing) return;
   p.playSeq++;
   const ended = p.phase === "ended" || (!p.hasAmbient && p.panelEl.ended);
@@ -2005,228 +2173,91 @@ function startNarration(p) {
     }
     if (p.phase === "pre-roll") {
       p.phaseStartMs = performance.now();
-      playNarrationMedia(p, p.ambientEl);
+      playIOSNarrationMedia(p, p.ambientEl);
     } else if (p.phase === "playing") {
-      playNarrationMedia(p, p.ambientEl);
-      playNarrationMedia(p, p.panelEl);
+      playIOSNarrationMedia(p, p.ambientEl);
+      playIOSNarrationMedia(p, p.panelEl);
     } else if (p.phase === "fade-out") {
       p.phaseStartMs = performance.now();
       if (p.ambientEl) p.ambientEl.volume = Math.max(0, AMBIENT_VOLUME * (1 - p.fadeOutPosAtStart));
-      playNarrationMedia(p, p.ambientEl);
+      playIOSNarrationMedia(p, p.ambientEl);
     }
   } else {
     if (ended) {
       p.panelEl.currentTime = 0;
       p.phase = "playing";
     }
-    playNarrationMedia(p, p.panelEl);
+    playIOSNarrationMedia(p, p.panelEl);
   }
 
   p.playing = true;
-  startPlayerTick(p);
+  if (!p.rafId) p.rafId = schedulePlayerLoop();
   setPlayerBtnState(p.playerEl, true);
-  // The voice is over during the ambient fade-out: nothing to duck for.
   if (p.phase !== "fade-out") narrationDucking.play(p.token);
-  // An explicit play is also a chance to restart a stalled music context.
   resumeSTContext();
-  syncMediaSession();
+  syncIOSMediaSession();
 }
 
-function pauseNarration(p) {
+function pauseIOSNarration(p) {
   if (!p || activePlayer !== p || !p.playing) return;
   p.playSeq++;
-  stopPlayerTick(p);
-  holdNarrationClock(p);
+  cancelPlayerLoop(p);
+  holdIOSNarrationClock(p);
   p.playing = false;
   pauseMedia(p.ambientEl);
   pauseMedia(p.panelEl);
   setPlayerBtnState(p.playerEl, false);
   narrationDucking.pause(p.token);
-  syncMediaSession();
+  syncIOSMediaSession();
 }
 
-// Natural end of the whole player (after the ambient fade-out, if any).
-// Idempotent: the `ended` event, the timer and the wake resync may all get here.
-function finishNarration(p) {
-  if (!p || activePlayer !== p || p.phase === "ended") return false;
+function finishIOSNarration(p) {
+  if (!p || activePlayer !== p || p.phase === "ended") return;
   p.playSeq++;
-  stopPlayerTick(p);
+  cancelPlayerLoop(p);
   if (p.ambientEl) { p.ambientEl.volume = 0; pauseMedia(p.ambientEl); }
   p.playing = false;
   p.phase = "ended";
   updatePlayerUI(p, p.totalDuration);
   setPlayerBtnState(p.playerEl, false);
   narrationDucking.finish(p.token);
-  syncMediaSession();
-  return true;
+  syncIOSMediaSession();
 }
 
-// Rejected playback or terminal media error: stop and restore the music.
-function failNarration(p) {
+function failIOSNarration(p) {
   if (!p || activePlayer !== p) return;
   p.playSeq++;
-  stopPlayerTick(p);
-  holdNarrationClock(p);
+  cancelPlayerLoop(p);
+  holdIOSNarrationClock(p);
   p.playing = false;
   pauseMedia(p.ambientEl);
   pauseMedia(p.panelEl);
   setPlayerBtnState(p.playerEl, false);
   narrationDucking.fail(p.token);
-  syncMediaSession();
+  syncIOSMediaSession();
 }
 
-// After returning from the background the timer may have been suspended: the
-// state is recomputed immediately and any element paused by the system is
-// resumed.
-function resyncActivePlayerAfterWake() {
+function resyncIOSPlayerAfterWake() {
   const p = activePlayer;
   if (!p || !p.playing) return;
   if (p.hasAmbient) {
     if ((p.phase === "pre-roll" || p.phase === "fade-out") && p.ambientEl?.paused) {
-      playNarrationMedia(p, p.ambientEl);
+      playIOSNarrationMedia(p, p.ambientEl);
     }
     if (p.phase === "playing") {
-      if (p.ambientEl?.paused) playNarrationMedia(p, p.ambientEl);
-      if (p.panelEl.paused && !p.panelEl.ended) playNarrationMedia(p, p.panelEl);
+      if (p.ambientEl?.paused) playIOSNarrationMedia(p, p.ambientEl);
+      if (p.panelEl.paused && !p.panelEl.ended) playIOSNarrationMedia(p, p.panelEl);
     }
   } else if (p.panelEl.paused && !p.panelEl.ended) {
-    playNarrationMedia(p, p.panelEl);
+    playIOSNarrationMedia(p, p.panelEl);
   }
-  startPlayerTick(p);
-  playerTick();
+  cancelPlayerLoop(p);
+  playerRaf();
 }
 
-function playerTick() {
-  if (!activePlayer) return;
-  const p = activePlayer;
+let iosPlayerUid = 0;
 
-  let vt;
-  if (p.hasAmbient) {
-    if (p.phase === "pre-roll") {
-      const elapsed = (performance.now() - p.phaseStartMs) / 1000 / p.panelEl.playbackRate;
-      const pos = p.preRollPosAtStart + elapsed;
-      vt = Math.min(1, pos);
-      if (pos >= 1) {
-        p.phase = "playing";
-        p.preRollPosAtStart = 0;
-        p.phaseStartMs = null;
-        playNarrationMedia(p, p.panelEl);
-      }
-    } else if (p.phase === "playing") {
-      vt = p.panelEl.currentTime + 1;
-      // Guard: panel ended before event fired
-      if (p.panelEl.ended) {
-        enterFadeOut(p);
-        narrationDucking.finish(p.token);
-      }
-    } else if (p.phase === "fade-out") {
-      const elapsed = (performance.now() - p.phaseStartMs) / 1000 / (p.ambientEl?.playbackRate || 1);
-      const pos = p.fadeOutPosAtStart + elapsed;
-      vt = p.panelDuration + 1 + pos;
-      // Fade ambient volume down to 0 over 1 second
-      if (p.ambientEl) p.ambientEl.volume = Math.max(0, AMBIENT_VOLUME * (1 - pos));
-      if (pos >= 1) {
-        finishNarration(p);
-        return;
-      }
-    } else {
-      // ended — the timer should not be running
-      return;
-    }
-  } else {
-    vt = p.panelEl.currentTime;
-    if (p.panelEl.ended) {
-      finishNarration(p);
-      return;
-    }
-  }
-
-  updatePlayerUI(p, vt);
-  startPlayerTick(p);
-}
-
-function updatePlayerUI(p, vt) {
-  const seekbar = p.playerEl.querySelector("[data-player-seek]");
-  const currentEl = p.playerEl.querySelector("[data-player-current]");
-  if (!p.isSeeking && seekbar) {
-    seekbar.value = p.totalDuration > 0 ? Math.round((vt / p.totalDuration) * 1000) : 0;
-  }
-  if (currentEl) currentEl.textContent = formatTime(vt);
-}
-
-function setPlayerBtnState(playerEl, isPlaying) {
-  const btn = playerEl.querySelector("[data-player-play]");
-  if (!btn) return;
-  btn.innerHTML = isPlaying ? ICONS.pause : ICONS.play;
-  btn.classList.toggle("player-btn--playing", isPlaying);
-  btn.setAttribute("aria-label", isPlaying ? t("player.pause") : t("player.play"));
-}
-
-function seekPlayer(vt) {
-  if (!activePlayer) return;
-  const p = activePlayer;
-  if (!(p.totalDuration > 0)) return;
-  const clamped = Math.max(0, Math.min(vt, p.totalDuration));
-
-  stopPlayerTick(p);
-
-  const wasPlaying = p.playing;
-
-  if (p.hasAmbient) {
-    if (clamped < 1) {
-      // pre-roll zone
-      pauseMedia(p.panelEl);
-      p.panelEl.currentTime = 0;
-      if (p.ambientEl) p.ambientEl.volume = AMBIENT_VOLUME;
-      p.phase = "pre-roll";
-      p.preRollPosAtStart = clamped;
-      p.phaseStartMs = wasPlaying ? performance.now() : null;
-      if (wasPlaying && p.ambientEl?.paused) playNarrationMedia(p, p.ambientEl);
-    } else if (clamped <= p.panelDuration + 1) {
-      // playing zone
-      p.panelEl.currentTime = clamped - 1;
-      if (p.ambientEl) p.ambientEl.volume = AMBIENT_VOLUME;
-      p.phase = "playing";
-      p.phaseStartMs = null;
-      if (wasPlaying) {
-        if (p.ambientEl?.paused) playNarrationMedia(p, p.ambientEl);
-        if (p.panelEl.paused) playNarrationMedia(p, p.panelEl);
-      }
-    } else {
-      // fade-out zone
-      const fadeOutPos = clamped - (p.panelDuration + 1);
-      pauseMedia(p.panelEl);
-      p.phase = "fade-out";
-      p.fadeOutPosAtStart = fadeOutPos;
-      p.phaseStartMs = wasPlaying ? performance.now() : null;
-      if (p.ambientEl) p.ambientEl.volume = Math.max(0, AMBIENT_VOLUME * (1 - fadeOutPos));
-      if (wasPlaying && p.ambientEl?.paused) playNarrationMedia(p, p.ambientEl);
-    }
-  } else {
-    p.panelEl.currentTime = clamped;
-    // Completion is left to the `ended` event / timer so it runs only once.
-    p.phase = "playing";
-    if (wasPlaying && p.panelEl.paused) playNarrationMedia(p, p.panelEl);
-  }
-
-  if (wasPlaying) {
-    // Seeking keeps (or, after the voice ended, re-applies) the ducking.
-    if (p.phase !== "fade-out") narrationDucking.play(p.token);
-    startPlayerTick(p);
-  } else {
-    updatePlayerUI(p, clamped);
-  }
-  // Pausing the voice while seeking into the pre-roll/fade-out resets the
-  // lock-screen state on WebKit.
-  syncMediaSession();
-}
-
-let narrationPlayerUid = 0;
-
-// Creates the player as soon as the panel opens, before the metadata is
-// known, so playback can start from the interaction itself. The duration-
-// dependent UI (total time, seekbar) is filled in when it arrives.
-function attachPlayer(contentEl, panelEl, ambientEl) {
+function attachIOSPlayer(contentEl, panelEl, ambientEl) {
   const playerEl = contentEl.querySelector(".custom-player");
   if (!playerEl) return null;
 
@@ -2237,11 +2268,11 @@ function attachPlayer(contentEl, panelEl, ambientEl) {
   const title = contentEl.closest(".panel")?.querySelector(".panel-title")?.textContent?.trim() || t("app.mediaFallbackTitle");
 
   const p = {
-    uid: ++narrationPlayerUid,
+    uid: ++iosPlayerUid,
     token: 0,
-    tickId: 0,
+    rafId: 0,
     playSeq: 0,
-    recoveredSeq: -1,        // playSeq whose OS pause was already retried
+    recoveredSeq: -1,
     listeners,
     playerEl,
     panelEl,
@@ -2250,9 +2281,9 @@ function attachPlayer(contentEl, panelEl, ambientEl) {
     totalDuration: 0,
     panelDuration: 0,
     phase: hasAmbient ? "pre-roll" : "playing",
-    phaseStartMs: null,      // null = not yet started / paused
-    preRollPosAtStart: 0,    // accumulated pre-roll seconds (0..1) at last pause
-    fadeOutPosAtStart: 0,    // accumulated fade-out seconds (0..1) at last pause
+    phaseStartMs: null,
+    preRollPosAtStart: 0,
+    fadeOutPosAtStart: 0,
     isSeeking: false,
     playing: false,
     mediaMetadata: typeof MediaMetadata === "function" ? new MediaMetadata({ title, artist: t("app.mediaArtist") }) : null,
@@ -2260,7 +2291,6 @@ function attachPlayer(contentEl, panelEl, ambientEl) {
   activePlayer = p;
   p.token = narrationDucking.attach();
 
-  // Set up audio volumes and rates (narration speed is independent of the music)
   panelEl.volume = 1;
   panelEl.playbackRate = playbackRate;
   if (ambientEl) {
@@ -2283,47 +2313,41 @@ function attachPlayer(contentEl, panelEl, ambientEl) {
   panelEl.addEventListener("loadedmetadata", readDuration, { signal });
   panelEl.addEventListener("durationchange", readDuration, { signal });
 
-  // Restoration is driven by the media event itself, not by the UI timer
-  // (throttled while locked). No { once } so replays also trigger it.
   panelEl.addEventListener("ended", () => {
     if (activePlayer !== p) return;
     if (!hasAmbient) {
-      finishNarration(p);
+      finishIOSNarration(p);
       return;
     }
-    // Modo A: the voice is over; the ambient fades out for one more second.
     if (p.phase !== "playing") return;
-    enterFadeOut(p);
+    p.phase = "fade-out";
+    p.fadeOutPosAtStart = 0;
+    p.phaseStartMs = performance.now();
+    if (p.ambientEl) p.ambientEl.volume = AMBIENT_VOLUME;
     narrationDucking.finish(p.token);
-    startPlayerTick(p);
+    if (!p.rafId) p.rafId = schedulePlayerLoop();
   }, { signal });
 
-  // Terminal media error while playback is requested.
   panelEl.addEventListener("error", () => {
     if (activePlayer !== p || !p.playing) return;
-    failNarration(p);
+    failIOSNarration(p);
   }, { signal });
 
-  // Recover once per play request from an unexpected OS-level pause (volume
-  // buttons, Bluetooth hiccups…). A second one is treated as an interruption
-  // (call, another app): the narration is shown paused and the music restored
-  // instead of fighting it. Pauses issued by the player itself (seeking into
-  // the pre-roll/fade-out) are not recoveries.
   panelEl.addEventListener("pause", () => {
     if (activePlayer !== p || !p.playing || panelEl.ended) return;
     if (hasAmbient && p.phase !== "playing") return;
     if (p.recoveredSeq === p.playSeq) {
-      pauseNarration(p);
+      pauseIOSNarration(p);
       return;
     }
     p.recoveredSeq = p.playSeq;
-    playNarrationMedia(p, panelEl);
+    playIOSNarrationMedia(p, panelEl);
   }, { signal });
 
   playerEl.querySelector("[data-player-play]")?.addEventListener("click", () => {
     if (activePlayer !== p) return;
-    if (p.playing) pauseNarration(p);
-    else startNarration(p);
+    if (p.playing) pauseIOSNarration(p);
+    else startIOSNarration(p);
   }, { signal });
 
   if (seekbar) {
@@ -2342,8 +2366,434 @@ function attachPlayer(contentEl, panelEl, ambientEl) {
     }, { signal });
   }
 
-  syncMediaSession();
+  syncIOSMediaSession();
   return p;
+}
+
+function stopActivePlayer() {
+  if (!activePlayer) return;
+  if (isIOS) {
+    const p = activePlayer;
+    activePlayer = null;
+    p.playSeq++;
+    p.playing = false;
+    p.listeners?.abort();
+    cancelPlayerLoop(p);
+    pauseMedia(p.panelEl);
+    pauseMedia(p.ambientEl);
+    narrationDucking.detach(p.token);
+    return;
+  }
+  if ("mediaSession" in navigator) {
+    navigator.mediaSession.metadata = null;
+    navigator.mediaSession.playbackState = "none";
+  }
+  restoreSTFade();
+  cancelAnimationFrame(activePlayer.rafId);
+  activePlayer.rafId = 0;
+  activePlayer.playing = false;
+  activePlayer.panelEl.pause();
+  if (activePlayer.ambientEl) activePlayer.ambientEl.pause();
+  activePlayer = null;
+}
+
+function playerRaf() {
+  if (!activePlayer) return;
+  const p = activePlayer;
+
+  let vt;
+  if (p.hasAmbient) {
+    if (p.phase === "pre-roll") {
+      const elapsed = (performance.now() - p.phaseStartMs) / 1000 / p.panelEl.playbackRate;
+      const pos = p.preRollPosAtStart + elapsed;
+      vt = Math.min(1, pos);
+      if (pos >= 1) {
+        p.phase = "playing";
+        p.preRollPosAtStart = 0;
+        p.phaseStartMs = null;
+        if (isIOS) playIOSNarrationMedia(p, p.panelEl);
+        else p.panelEl.play().catch(() => {});
+      }
+    } else if (p.phase === "playing") {
+      vt = p.panelEl.currentTime + 1;
+      // Guard: panel ended before event fired
+      if (p.panelEl.ended) {
+        p.phase = "fade-out";
+        p.fadeOutPosAtStart = 0;
+        p.phaseStartMs = performance.now();
+        if (p.ambientEl) p.ambientEl.volume = AMBIENT_VOLUME;
+        if (isIOS) narrationDucking.finish(p.token);
+      }
+    } else if (p.phase === "fade-out") {
+      const elapsed = (performance.now() - p.phaseStartMs) / 1000 / (p.ambientEl?.playbackRate || 1);
+      const pos = p.fadeOutPosAtStart + elapsed;
+      vt = p.panelDuration + 1 + pos;
+      // Fade ambient volume down to 0 over 1 second
+      if (p.ambientEl) p.ambientEl.volume = Math.max(0, AMBIENT_VOLUME * (1 - pos));
+      if (pos >= 1) {
+        if (isIOS) { finishIOSNarration(p); return; }
+        vt = p.totalDuration;
+        if (p.ambientEl) { p.ambientEl.volume = 0; p.ambientEl.pause(); }
+        updatePlayerUI(p, vt);
+        setPlayerBtnState(p.playerEl, false);
+        p.playing = false;
+        updateMediaSession(false);
+        restoreSTFade();
+        cancelAnimationFrame(p.rafId);
+        p.rafId = 0;
+        p.phase = "ended";
+        return;
+      }
+    } else {
+      // ended — rAF should not be running
+      return;
+    }
+  } else {
+    vt = p.panelEl.currentTime;
+    if (p.panelEl.ended) {
+      if (isIOS) { finishIOSNarration(p); return; }
+      vt = p.totalDuration;
+      updatePlayerUI(p, vt);
+      setPlayerBtnState(p.playerEl, false);
+      p.playing = false;
+      updateMediaSession(false);
+      restoreSTFade();
+      cancelAnimationFrame(p.rafId);
+      p.rafId = 0;
+      p.phase = "ended";
+      return;
+    }
+  }
+
+  updatePlayerUI(p, vt);
+  p.rafId = schedulePlayerLoop();
+}
+
+function updatePlayerUI(p, vt) {
+  const seekbar = p.playerEl.querySelector("[data-player-seek]");
+  const currentEl = p.playerEl.querySelector("[data-player-current]");
+  if (!p.isSeeking && seekbar) {
+    seekbar.value = p.totalDuration > 0 ? Math.round((vt / p.totalDuration) * 1000) : 0;
+  }
+  if (currentEl) currentEl.textContent = formatTime(vt);
+}
+
+function setPlayerBtnState(playerEl, isPlaying) {
+  const btn = playerEl.querySelector("[data-player-play]");
+  if (!btn) return;
+  btn.innerHTML = isPlaying ? ICONS.pause : ICONS.play;
+  btn.classList.toggle("player-btn--playing", isPlaying);
+  btn.setAttribute("aria-label", isPlaying ? t("player.pause") : t("player.play"));
+}
+
+function seekPlayer(vt) {
+  if (!activePlayer) return;
+  const p = activePlayer;
+  if (isIOS && !(p.totalDuration > 0)) return;
+  const clamped = Math.max(0, Math.min(vt, p.totalDuration));
+
+  cancelPlayerLoop(p);
+
+  const wasPlaying = isIOS
+    ? p.playing
+    : (p.hasAmbient ? !(p.ambientEl?.paused ?? true) : !p.panelEl.paused);
+
+  if (p.hasAmbient) {
+    if (clamped < 1) {
+      // pre-roll zone
+      if (isIOS) pauseMedia(p.panelEl); else p.panelEl.pause();
+      p.panelEl.currentTime = 0;
+      if (p.ambientEl) p.ambientEl.volume = AMBIENT_VOLUME;
+      p.phase = "pre-roll";
+      p.preRollPosAtStart = clamped;
+      p.phaseStartMs = wasPlaying ? performance.now() : null;
+      if (wasPlaying && p.ambientEl?.paused) {
+        if (isIOS) playIOSNarrationMedia(p, p.ambientEl);
+        else p.ambientEl.play().catch(() => {});
+      }
+    } else if (clamped <= p.panelDuration + 1) {
+      // playing zone
+      p.panelEl.currentTime = clamped - 1;
+      if (p.ambientEl) p.ambientEl.volume = AMBIENT_VOLUME;
+      p.phase = "playing";
+      p.phaseStartMs = null;
+      if (wasPlaying) {
+        if (p.ambientEl?.paused) {
+          if (isIOS) playIOSNarrationMedia(p, p.ambientEl);
+          else p.ambientEl.play().catch(() => {});
+        }
+        if (p.panelEl.paused) {
+          if (isIOS) playIOSNarrationMedia(p, p.panelEl);
+          else p.panelEl.play().catch(() => {});
+        }
+      }
+    } else {
+      // fade-out zone
+      const fadeOutPos = clamped - (p.panelDuration + 1);
+      if (isIOS) pauseMedia(p.panelEl); else p.panelEl.pause();
+      p.phase = "fade-out";
+      p.fadeOutPosAtStart = fadeOutPos;
+      p.phaseStartMs = wasPlaying ? performance.now() : null;
+      if (p.ambientEl) p.ambientEl.volume = Math.max(0, AMBIENT_VOLUME * (1 - fadeOutPos));
+      if (wasPlaying && p.ambientEl?.paused) {
+        if (isIOS) playIOSNarrationMedia(p, p.ambientEl);
+        else p.ambientEl.play().catch(() => {});
+      }
+    }
+  } else {
+    p.panelEl.currentTime = clamped;
+    p.phase = isIOS ? "playing" : (clamped < p.totalDuration ? "playing" : "ended");
+    if (wasPlaying && p.panelEl.paused) {
+      if (isIOS) playIOSNarrationMedia(p, p.panelEl);
+      else p.panelEl.play().catch(() => {});
+    }
+  }
+
+  if (wasPlaying) {
+    if (isIOS && p.phase !== "fade-out") narrationDucking.play(p.token);
+    p.rafId = schedulePlayerLoop();
+  } else {
+    updatePlayerUI(p, clamped);
+  }
+  if (isIOS) syncIOSMediaSession();
+}
+
+function updateMediaSession(playing) {
+  if (!("mediaSession" in navigator)) return;
+  navigator.mediaSession.playbackState = playing ? "playing" : "paused";
+}
+
+function pauseActivePlayerInternal() {
+  if (!activePlayer) return;
+  const p = activePlayer;
+  cancelAnimationFrame(p.rafId);
+  p.rafId = 0;
+  if (p.hasAmbient) {
+    if (p.phase === "pre-roll") {
+      const elapsed = (performance.now() - p.phaseStartMs) / 1000 / p.panelEl.playbackRate;
+      p.preRollPosAtStart = Math.min(1, p.preRollPosAtStart + elapsed);
+      p.phaseStartMs = null;
+    } else if (p.phase === "fade-out") {
+      const elapsed = (performance.now() - p.phaseStartMs) / 1000 / (p.ambientEl?.playbackRate || 1);
+      p.fadeOutPosAtStart = Math.min(1, p.fadeOutPosAtStart + elapsed);
+      p.phaseStartMs = null;
+    }
+    p.ambientEl?.pause();
+  }
+  p.playing = false;
+  p.panelEl.pause();
+  setPlayerBtnState(p.playerEl, false);
+  updateMediaSession(false);
+  restoreSTFade();
+}
+
+function resumeActivePlayerInternal() {
+  if (!activePlayer) return;
+  const p = activePlayer;
+  if (p.hasAmbient) {
+    if (p.phase === "pre-roll") {
+      p.phaseStartMs = performance.now();
+      p.ambientEl?.play().catch(() => {});
+    } else if (p.phase === "playing") {
+      p.ambientEl?.play().catch(() => {});
+      p.panelEl.play().catch(() => {});
+    } else if (p.phase === "fade-out") {
+      p.phaseStartMs = performance.now();
+      if (p.ambientEl) {
+        p.ambientEl.volume = Math.max(0, AMBIENT_VOLUME * (1 - p.fadeOutPosAtStart));
+        p.ambientEl.play().catch(() => {});
+      }
+    }
+  } else {
+    if (!p.panelEl.ended) p.panelEl.play().catch(() => {});
+  }
+  p.playing = true;
+  p.rafId = requestAnimationFrame(playerRaf);
+  setPlayerBtnState(p.playerEl, true);
+  updateMediaSession(true);
+  duckST();
+}
+
+function initPlayer(contentEl, panelEl, ambientEl, totalDuration, panelDuration) {
+  const playerEl = contentEl.querySelector(".custom-player");
+  if (!playerEl) return;
+
+  const hasAmbient = !!ambientEl;
+
+  activePlayer = {
+    rafId: 0,
+    playerEl,
+    panelEl,
+    ambientEl: ambientEl || null,
+    hasAmbient,
+    totalDuration,
+    panelDuration,
+    phase: hasAmbient ? "pre-roll" : "playing",
+    phaseStartMs: null,      // null = not yet started / paused
+    preRollPosAtStart: 0,    // accumulated pre-roll seconds (0..1) at last pause
+    fadeOutPosAtStart: 0,    // accumulated fade-out seconds (0..1) at last pause
+    isSeeking: false,
+    playing: false,
+  };
+
+  // Set up audio volumes and rates
+  panelEl.volume = 1;
+  panelEl.playbackRate = playbackRate;
+  if (ambientEl) {
+    ambientEl.volume = AMBIENT_VOLUME;
+    ambientEl.playbackRate = playbackRate;
+  }
+
+  // Update total time display
+  const totalEl = playerEl.querySelector("[data-player-total]");
+  if (totalEl) totalEl.textContent = formatTime(totalDuration);
+
+  // Enable seekbar
+  const seekbar = playerEl.querySelector("[data-player-seek]");
+  if (seekbar) seekbar.removeAttribute("disabled");
+
+  // Panel ended → enter fade-out phase (Modo A). No { once } so replays also trigger it.
+  if (hasAmbient) {
+    panelEl.addEventListener("ended", () => {
+      if (!activePlayer || activePlayer.panelEl !== panelEl) return;
+      if (activePlayer.phase !== "playing") return;
+      activePlayer.phase = "fade-out";
+      activePlayer.fadeOutPosAtStart = 0;
+      activePlayer.phaseStartMs = performance.now();
+      if (activePlayer.ambientEl) activePlayer.ambientEl.volume = AMBIENT_VOLUME;
+      if (!activePlayer.rafId) activePlayer.rafId = requestAnimationFrame(playerRaf);
+    });
+  }
+
+  // Recover from unexpected OS-level pause (volume buttons, audio focus loss, Bluetooth, etc.)
+  panelEl.addEventListener("pause", () => {
+    if (!activePlayer || activePlayer.panelEl !== panelEl) return;
+    if (!activePlayer.playing || panelEl.ended) return;
+    panelEl.play().catch(() => {});
+  });
+
+  // Register MediaSession metadata and action handlers for OS media controls
+  if ("mediaSession" in navigator) {
+    const title = contentEl.closest(".panel")?.querySelector(".panel-title")?.textContent?.trim() || t("app.mediaFallbackTitle");
+    navigator.mediaSession.metadata = new MediaMetadata({ title, artist: t("app.mediaArtist") });
+    navigator.mediaSession.setActionHandler("play", () => playerEl.querySelector("[data-player-play]")?.click());
+    navigator.mediaSession.setActionHandler("pause", () => playerEl.querySelector("[data-player-play]")?.click());
+    navigator.mediaSession.setActionHandler("stop", () => stopActivePlayer());
+  }
+
+  // Play/pause button
+  playerEl.querySelector("[data-player-play]")?.addEventListener("click", () => {
+    if (!activePlayer) return;
+    const p = activePlayer;
+
+    if (p.hasAmbient) {
+      // ── Restart after end ──
+      if (p.phase === "ended") {
+        if (p.ambientEl) { p.ambientEl.volume = AMBIENT_VOLUME; p.ambientEl.currentTime = 0; }
+        p.panelEl.currentTime = 0;
+        p.phase = "pre-roll";
+        p.preRollPosAtStart = 0;
+        p.fadeOutPosAtStart = 0;
+        p.phaseStartMs = performance.now();
+        p.ambientEl?.play().catch(() => {});
+        p.rafId = requestAnimationFrame(playerRaf);
+        setPlayerBtnState(playerEl, true);
+        p.playing = true;
+        updateMediaSession(true);
+        duckST();
+        return;
+      }
+
+      const isPlaying = !(p.ambientEl?.paused ?? true);
+
+      if (isPlaying) {
+        // Pause — accumulate progress in current phase
+        cancelAnimationFrame(p.rafId);
+        p.rafId = 0;
+        if (p.phase === "pre-roll") {
+          const elapsed = (performance.now() - p.phaseStartMs) / 1000 / p.panelEl.playbackRate;
+          p.preRollPosAtStart = Math.min(1, p.preRollPosAtStart + elapsed);
+          p.phaseStartMs = null;
+        } else if (p.phase === "fade-out") {
+          const elapsed = (performance.now() - p.phaseStartMs) / 1000 / (p.ambientEl?.playbackRate || 1);
+          p.fadeOutPosAtStart = Math.min(1, p.fadeOutPosAtStart + elapsed);
+          p.phaseStartMs = null;
+        }
+        p.playing = false;
+        p.ambientEl?.pause();
+        p.panelEl.pause();
+        setPlayerBtnState(playerEl, false);
+        updateMediaSession(false);
+        restoreSTFade();
+      } else {
+        // Resume — phaseStartMs restarts from accumulated pos
+        if (p.phase === "pre-roll") {
+          p.phaseStartMs = performance.now();
+          p.ambientEl?.play().catch(() => {});
+        } else if (p.phase === "playing") {
+          p.ambientEl?.play().catch(() => {});
+          p.panelEl.play().catch(() => {});
+        } else if (p.phase === "fade-out") {
+          p.phaseStartMs = performance.now();
+          if (p.ambientEl) {
+            p.ambientEl.volume = Math.max(0, AMBIENT_VOLUME * (1 - p.fadeOutPosAtStart));
+            p.ambientEl.play().catch(() => {});
+          }
+        }
+        p.rafId = requestAnimationFrame(playerRaf);
+        setPlayerBtnState(playerEl, true);
+        p.playing = true;
+        updateMediaSession(true);
+        duckST();
+      }
+    } else {
+      // ── Modo B ──
+      if (p.phase === "ended" || p.panelEl.ended) {
+        p.panelEl.currentTime = 0;
+        p.phase = "playing";
+        p.panelEl.play().catch(() => {});
+        p.rafId = requestAnimationFrame(playerRaf);
+        setPlayerBtnState(playerEl, true);
+        p.playing = true;
+        updateMediaSession(true);
+        duckST();
+        return;
+      }
+      if (p.panelEl.paused) {
+        p.panelEl.play().catch(() => {});
+        p.rafId = requestAnimationFrame(playerRaf);
+        setPlayerBtnState(playerEl, true);
+        p.playing = true;
+        updateMediaSession(true);
+        duckST();
+      } else {
+        p.playing = false;
+        p.panelEl.pause();
+        cancelAnimationFrame(p.rafId);
+        p.rafId = 0;
+        setPlayerBtnState(playerEl, false);
+        updateMediaSession(false);
+        restoreSTFade();
+      }
+    }
+  });
+
+  // Seekbar interaction
+  if (seekbar) {
+    seekbar.addEventListener("mousedown", () => { if (activePlayer) activePlayer.isSeeking = true; });
+    seekbar.addEventListener("touchstart", () => { if (activePlayer) activePlayer.isSeeking = true; }, { passive: true });
+    seekbar.addEventListener("input", () => {
+      if (!activePlayer) return;
+      const vt = (parseInt(seekbar.value, 10) / 1000) * activePlayer.totalDuration;
+      updatePlayerUI(activePlayer, vt);
+    });
+    seekbar.addEventListener("change", () => {
+      if (!activePlayer) return;
+      activePlayer.isSeeking = false;
+      const vt = (parseInt(seekbar.value, 10) / 1000) * activePlayer.totalDuration;
+      seekPlayer(vt);
+    });
+  }
 }
 
 function togglePanel(panelId) {
@@ -2378,8 +2828,40 @@ function togglePanel(panelId) {
         const panelEl = contentEl.querySelector('audio[data-role="panel"]');
         const ambientEl = contentEl.querySelector('audio[data-role="ambient"]');
         if (!panelEl) return;
-        const p = attachPlayer(contentEl, panelEl, ambientEl || null);
-        if (p && autoPlay) startNarration(p);
+
+        if (isIOS) {
+          const p = attachIOSPlayer(contentEl, panelEl, ambientEl || null);
+          if (p && autoPlay) startIOSNarration(p);
+          return;
+        }
+
+        const setupAndStart = () => {
+          const panelDuration = panelEl.duration;
+          const totalDuration = ambientEl ? panelDuration + 2 : panelDuration;
+          initPlayer(contentEl, panelEl, ambientEl || null, totalDuration, panelDuration);
+          if (autoPlay) {
+            duckSTFade(() => {
+              const p = activePlayer;
+              if (!p) return;
+              if (p.hasAmbient) {
+                p.phaseStartMs = performance.now();
+                ambientEl.play().catch(() => {});
+              } else {
+                panelEl.play().catch(() => {});
+              }
+              p.rafId = requestAnimationFrame(playerRaf);
+              setPlayerBtnState(p.playerEl, true);
+              p.playing = true;
+              updateMediaSession(true);
+            });
+          }
+        };
+
+        if (isFinite(panelEl.duration) && panelEl.duration > 0) {
+          setupAndStart();
+        } else {
+          panelEl.addEventListener("loadedmetadata", setupAndStart, { once: true });
+        }
       }
     }
   }
@@ -2388,7 +2870,7 @@ function togglePanel(panelId) {
 function collapseBranch(panelId) {
   stopActivePlayer();
   const contentEl = document.getElementById(`${panelId}-content`);
-  contentEl?.querySelectorAll("audio").forEach(pauseMedia);
+  contentEl?.querySelectorAll("audio").forEach((a) => (isIOS ? pauseMedia(a) : a.pause()));
   expandedPanels.delete(panelId);
   revealedDescriptions.delete(panelId);
   const children = accordionIndex.childrenByParent.get(panelId) || [];

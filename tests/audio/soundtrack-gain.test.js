@@ -7,6 +7,7 @@ import {
   RESTORE_RAMP_MS,
   computeGainTarget,
   createSoundtrackGain,
+  isIOSDevice,
   setAudioSessionType,
   supportsSoundtrackGain,
 } from "../../src/soundtrack-gain.js";
@@ -129,11 +130,16 @@ test("resume reports whether the context is actually running", async () => {
   assert.equal(await rejected.gain.resume(), false);
 });
 
-test("feature detection and audio session type", () => {
+test("feature detection, iOS detection, and audio session type", () => {
   class Ctx { createMediaElementSource() {} createGain() {} }
   assert.equal(supportsSoundtrackGain({ AudioContext: Ctx }), true);
   assert.equal(supportsSoundtrackGain({ webkitAudioContext: Ctx }), true);
   assert.equal(supportsSoundtrackGain({}), false);
+
+  assert.equal(isIOSDevice({ userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)" }), true);
+  assert.equal(isIOSDevice({ userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", maxTouchPoints: 5 }), true);
+  assert.equal(isIOSDevice({ userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", maxTouchPoints: 0 }), false);
+  assert.equal(isIOSDevice({ userAgent: "Mozilla/5.0 (Linux; Android 14)" }), false);
 
   const nav = { audioSession: { type: "auto" } };
   assert.equal(setAudioSessionType("playback", nav), true);
