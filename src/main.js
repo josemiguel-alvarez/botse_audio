@@ -2,6 +2,16 @@ import "./styles.css";
 import { t, getLang, setLang, LANGUAGES, getContent } from "./i18n.js";
 import SOUNDTRACK from "./i18n/es/soundtrack.json";
 import CardScanner, { CROP } from "./card-scanner.js";
+import {
+  RESTORE_RAMP_MS,
+  SOUNDTRACK_MODES,
+  createSoundtrackGain,
+  getAudioContextClass,
+  resolveSoundtrackMode,
+  setAudioSessionType,
+  supportsEnhancedSoundtrack,
+} from "./soundtrack-gain.js";
+import { applyMediaSessionControls, createNarrationDucking } from "./narration-ducking.js";
 
 // ── Data (split across multiple files for maintainability) ──────────────────
 import _start from "./i18n/es/data/start.json";
@@ -136,6 +146,7 @@ function loadState() {
     recognizerConfirmCard: false,
     playbackRate: 1,
     stEnabled: false,
+    stAudioMode: "compat",
     provinciaCollapsed: false,
     gremioCollapsed: false,
     narrationsCollapsed: false,
@@ -156,6 +167,7 @@ function saveState() {
       recognizerConfirmCard,
       playbackRate,
       stEnabled,
+      stAudioMode,
       provinciaCollapsed,
       gremioCollapsed,
       narrationsCollapsed,
@@ -176,6 +188,9 @@ let autoPlay = typeof state.autoPlay === "boolean" ? state.autoPlay : true;
 let recognizerConfirmCard = typeof state.recognizerConfirmCard === "boolean" ? state.recognizerConfirmCard : false;
 let playbackRate = [1, 1.15, 1.25, 1.5].includes(state.playbackRate) ? state.playbackRate : 1;
 let stEnabled = typeof (state.stEnabled ?? state.ytEnabled) === "boolean" ? (state.stEnabled ?? state.ytEnabled) : false;
+// Soundtrack backend requested by the user. Existing installations keep the
+// compatibility mode; the enhanced mode is opt-in while it is evaluated.
+let stAudioMode = state.stAudioMode === "enhanced" ? "enhanced" : "compat";
 
 // Vista activa: "inicio" (bienvenida) o "narraciones"
 let view = state.view === "narraciones" ? "narraciones" : "inicio";
@@ -401,17 +416,158 @@ const stCanSetVolume = (() => {
     return false;
   }
 })();
+
+// Two soundtrack backends:
+// - compat (default): native element output. Ducking ends in `muted` (instant
+//   on iOS, faded where volume works).
+// - enhanced (opt-in, iOS): the element is routed through a GainNode, so the
+//   music can be lowered instead of muted. It is offered on iOS/iPadOS only
+//   (and on any browser in development builds, to exercise it on a desktop).
+const stEnhancedSupported = supportsEnhancedSoundtrack(window);
+const stEnhancedOffered = stEnhancedSupported && (stIsIOS || import.meta.env.DEV);
+const resolveSTMode = () => resolveSoundtrackMode({
+  requested: stAudioMode,
+  isIOS: stIsIOS,
+  allowAnyPlatform: import.meta.env.DEV,
+  supported: stEnhancedSupported,
+});
+// How the current stAudio element is wired. Only changes by recreating it.
+let stActiveMode = resolveSTMode();
+const stIsEnhanced = () => stActiveMode === SOUNDTRACK_MODES.ENHANCED;
+const stSupportsVolumeControl = () => stIsEnhanced() || stCanSetVolume;
+
+// The playback session must be set before any audio starts.
+if (stIsEnhanced()) setAudioSessionType("playback");
+
+/** @type {ReturnType<typeof createSoundtrackGain> | null} */
+let stGain = null;
+/** @type {AbortController | null} listeners of the current stAudio element */
+let stListeners = null;
+// Whether the user wants the music playing. System pauses (calls, other apps)
+// do not change it, so foreground reconciliation never overrides a user pause.
+let stPlayIntent = false;
+
 let stCurrentTrack = (typeof state.stCurrentTrack === "number" && state.stCurrentTrack >= 0 && state.stCurrentTrack < SOUNDTRACK.length) ? state.stCurrentTrack : 0;
 let stVolume = (typeof state.stVolume === "number" && state.stVolume >= 0 && state.stVolume <= 100) ? state.stVolume : 100;
 let stRestoreTime = (typeof state.stCurrentTime === "number" && state.stCurrentTime > 0) ? state.stCurrentTime : 0;
 let stSaveTickCount = 0;
+// Compatibility backend only: whether the mute/fade duck is applied.
 let stIsDucked = false;
+let stFadeId = 0;
 let stPollId = null;
 let stIsSeeking = false;
 let stIsDownloading = false;
 /** @type {Promise<void> | null} */
 let stDownloadPromise = null;
 const stObjectUrls = {}; // index → objectURL (para revocar al cambiar pista)
+
+// Narration lifecycle → requested ducking + lock-screen ownership.
+const narrationDucking = createNarrationDucking({
+  onChange: (snap, reason) => {
+    logAudio(`narration:${reason}`, { status: snap.status, owner: snap.owner });
+    applySTDuck(snap.ducked);
+    syncMediaSession();
+  },
+});
+
+// ── Audio diagnostics ─────────────────────────────────────
+// Ring buffer of audio events (context state, media events, positions and the
+// requested ducking state), persisted so a device test run with the screen
+// locked and no Web Inspector attached can be inspected afterwards.
+// A "running" context is recorded as such; it does not prove audible output.
+const AUDIO_DIAG_KEY = "botse_audio:audioDiag";
+const AUDIO_DIAG_LIMIT = 400;
+const audioDiag = (() => {
+  try {
+    const saved = JSON.parse(localStorage.getItem(AUDIO_DIAG_KEY) || "[]");
+    return Array.isArray(saved) ? saved.slice(-AUDIO_DIAG_LIMIT) : [];
+  } catch {
+    return [];
+  }
+})();
+let audioDiagSaveId = 0;
+const roundTime = (value) => (Number.isFinite(value) ? Math.round(value * 100) / 100 : null);
+
+function logAudio(event, details) {
+  const p = activePlayer;
+  audioDiag.push({
+    at: new Date().toISOString(),
+    ev: event,
+    vis: document.visibilityState,
+    mode: stActiveMode,
+    ctx: stGain ? stGain.contextState : null,
+    gain: stGain ? roundTime(stGain.currentValue()) : null,
+    st: stAudio ? { paused: stAudio.paused, t: roundTime(stAudio.currentTime), muted: stAudio.muted } : null,
+    duck: narrationDucking.snapshot().ducked,
+    nar: p ? { phase: p.phase, playing: p.playing, t: roundTime(p.panelEl.currentTime) } : null,
+    ...details,
+  });
+  if (audioDiag.length > AUDIO_DIAG_LIMIT) audioDiag.splice(0, audioDiag.length - AUDIO_DIAG_LIMIT);
+  if (import.meta.env.DEV) console.debug("[audio]", event, details ?? "");
+  if (!audioDiagSaveId) audioDiagSaveId = setTimeout(flushAudioDiag, 1000);
+}
+
+function flushAudioDiag() {
+  clearTimeout(audioDiagSaveId);
+  audioDiagSaveId = 0;
+  try {
+    localStorage.setItem(AUDIO_DIAG_KEY, JSON.stringify(audioDiag));
+  } catch {}
+}
+
+function audioDiagReport() {
+  return JSON.stringify({
+    userAgent: navigator.userAgent,
+    standalone: window.matchMedia?.("(display-mode: standalone)")?.matches || navigator.standalone === true,
+    audioSession: navigator.audioSession?.type ?? null,
+    requestedMode: stAudioMode,
+    activeMode: stActiveMode,
+    entries: audioDiag,
+  }, null, 1);
+}
+
+// Console access: copy(botseAudioDiag.report())
+window.botseAudioDiag = {
+  entries: () => audioDiag.slice(),
+  report: audioDiagReport,
+  clear: () => { audioDiag.length = 0; flushAudioDiag(); },
+};
+
+async function exportAudioDiagnostics() {
+  const report = audioDiagReport();
+  try {
+    await navigator.clipboard.writeText(report);
+    showAudioNotice(t("audio.diagnosticsCopied"));
+    return;
+  } catch {}
+  // Clipboard unavailable: offer the report as a file instead.
+  const url = URL.createObjectURL(new Blob([report], { type: "application/json" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `botse-audio-diag-${Date.now()}.json`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+  showAudioNotice(t("audio.diagnosticsDownloaded"));
+}
+
+// ── Audio feedback ────────────────────────────────────────
+const audioNoticeEl = document.createElement("div");
+audioNoticeEl.className = "audio-notice";
+audioNoticeEl.setAttribute("role", "status");
+audioNoticeEl.setAttribute("aria-live", "polite");
+audioNoticeEl.hidden = true;
+document.body.appendChild(audioNoticeEl);
+let audioNoticeTimer = 0;
+
+function showAudioNotice(message) {
+  logAudio("notice", { message });
+  audioNoticeEl.textContent = message;
+  audioNoticeEl.hidden = false;
+  clearTimeout(audioNoticeTimer);
+  audioNoticeTimer = setTimeout(() => { audioNoticeEl.hidden = true; }, 6000);
+}
 
 function stTrackUrl(index) {
   const src = SOUNDTRACK[index]?.src ?? "";
@@ -426,29 +582,144 @@ function stTrackUrl(index) {
   return `${import.meta.env.BASE_URL}${src}`;
 }
 
+const ST_LOGGED_EVENTS = ["play", "playing", "pause", "waiting", "stalled", "ended", "error", "emptied"];
+
 function setupSTPlayer() {
   if (stAudio) return;
   if (!SOUNDTRACK.length) return;
-  stAudio = new Audio();
-  stAudio.preload = "metadata";
-  // Important: do NOT route the element through an AudioContext. On iOS, audio
-  // served via Web Audio goes silent when the screen is locked (the context
-  // becomes "interrupted" and cannot be resumed from the background).
-  stAudio.volume = stVolume / 100;
-  stAudio.addEventListener("ended", () => {
-    stCurrentTrack = (stCurrentTrack + 1) % SOUNDTRACK.length;
-    loadSTTrack(stCurrentTrack).then(() => {
-      stAudio.play().catch(() => {});
+  const el = new Audio();
+  el.preload = "metadata";
+  stListeners = new AbortController();
+  const { signal } = stListeners;
+
+  if (stIsEnhanced()) {
+    // Before any src: the remote file must be fetched with CORS to be routed
+    // through Web Audio (otherwise the graph outputs silence). Cached Blob
+    // URLs are same-origin and unaffected.
+    el.crossOrigin = "anonymous";
+    // The selected volume lives in the gain node.
+    el.volume = 1;
+    stGain = createSoundtrackGain({
+      mediaElement: el,
+      createContext: () => new (getAudioContextClass(window))(),
+      volume: stVolume / 100,
+      ducked: narrationDucking.snapshot().ducked,
+      onStateChange: handleSTContextState,
     });
-    updateSTUI();
-    saveState();
-    updateSTMediaSession(true);
-  });
-  stAudio.addEventListener("pause", saveState);
+  } else {
+    // Compatibility mode: do NOT route the element through an AudioContext.
+    el.volume = stVolume / 100;
+  }
+
+  stAudio = el;
+  el.addEventListener("ended", handleSTEnded, { signal });
+  el.addEventListener("pause", saveState, { signal });
+  // Also covers pauses/resumes by the system (calls, other apps, headphones).
+  for (const type of ["play", "pause"]) {
+    el.addEventListener(type, () => { updateSTUI(); syncMediaSession(); }, { signal });
+  }
+  for (const type of ST_LOGGED_EVENTS) {
+    el.addEventListener(type, () => logAudio(`st:${type}`, type === "error" ? { code: el.error?.code } : undefined), { signal });
+  }
+  if (!stIsEnhanced() && narrationDucking.snapshot().ducked) duckSTNative();
+}
+
+// Releases the element, its listeners and (enhanced) its context. Disconnecting
+// the graph does not give an element its native output back, so switching
+// backends always goes through a new element.
+function teardownSTPlayer() {
+  if (!stAudio) return;
+  const el = stAudio;
+  const gain = stGain;
+  stListeners?.abort();
+  stListeners = null;
+  cancelSTFade();
+  el.pause();
+  el.removeAttribute("src");
+  el.load();
+  stAudio = null;
+  stGain = null;
+  stIsDucked = false;
+  gain?.dispose();
+}
+
+function handleSTEnded() {
+  stCurrentTrack = (stCurrentTrack + 1) % SOUNDTRACK.length;
+  loadSTTrack(stCurrentTrack).then(() => playST());
+  updateSTUI();
+  saveState();
+  syncMediaSession();
+}
+
+function handleSTContextState(contextState) {
+  logAudio("st:ctx-state", { state: contextState });
+}
+
+// Creates/resumes the context. Must run synchronously inside a user
+// interaction for iOS to let it start.
+function resumeSTContext(reason) {
+  if (!stGain || stGain.contextState === "running") return;
+  try {
+    stGain.resume().then(
+      (running) => logAudio("st:ctx-resume", { reason, running }),
+      (err) => logAudio("st:ctx-error", { reason, message: String(err?.message || err) })
+    );
+  } catch (err) {
+    logAudio("st:ctx-error", { reason, message: String(err?.message || err) });
+  }
+}
+
+// Any real interaction is a chance to (re)start a context that is not
+// running. Only the context is resumed; a paused element stays paused.
+for (const type of ["touchend", "click", "keydown"]) {
+  document.addEventListener(type, () => resumeSTContext(`gesture:${type}`), { capture: true, passive: true });
+}
+
+// Every soundtrack play() goes through here so rejections are recorded and,
+// for explicit requests, reported instead of being swallowed.
+function playST({ userInitiated = false, failureMessage } = {}) {
+  if (!stAudio) return Promise.resolve(false);
+  const el = stAudio;
+  resumeSTContext(userInitiated ? "play" : "auto-play");
+  let playing;
+  try {
+    playing = Promise.resolve(el.play());
+  } catch (err) {
+    playing = Promise.reject(err);
+  }
+  return playing.then(
+    () => {
+      // Only a playback that actually started counts as wanting the music
+      // (a rejected autoplay must not trigger "interrupted" notices later),
+      // and a pause issued meanwhile wins.
+      if (el === stAudio && !el.paused) stPlayIntent = true;
+      return true;
+    },
+    (err) => {
+      logAudio("st:play-rejected", { name: err?.name, message: err?.message, userInitiated });
+      if (el !== stAudio || err?.name === "AbortError") return false;
+      if (userInitiated) showAudioNotice(failureMessage || t("audio.musicPlayFailed"));
+      updateSTUI();
+      syncMediaSession();
+      return false;
+    }
+  );
+}
+
+// Seeks once the metadata is known (setting currentTime earlier is unreliable).
+function seekSTWhenReady(time) {
+  if (!(time > 0) || !stAudio) return;
+  const el = stAudio;
+  const apply = () => {
+    try { el.currentTime = time; } catch (_) {}
+  };
+  if (el.readyState >= 1) apply();
+  else el.addEventListener("loadedmetadata", apply, { once: true, signal: stListeners?.signal });
 }
 
 async function loadSTTrack(index) {
   if (!stAudio || !SOUNDTRACK[index]) return;
+  const el = stAudio;
   const url = stTrackUrl(index);
 
   // Revocar objectURL anterior de este slot
@@ -465,8 +736,10 @@ async function loadSTTrack(index) {
         const blob = await cached.blob();
         const objectUrl = URL.createObjectURL(blob);
         stObjectUrls[index] = objectUrl;
-        stAudio.src = objectUrl;
-        stAudio.load();
+        // The element may have been replaced (mode switch) while awaiting.
+        if (el !== stAudio) return;
+        el.src = objectUrl;
+        el.load();
         return;
       }
     } catch (_) {}
@@ -475,8 +748,18 @@ async function loadSTTrack(index) {
   if (import.meta.env.DEV) {
     console.warn("[ST] cache miss, cargando directo desde red:", url);
   }
-  stAudio.src = url;
-  stAudio.load();
+  if (el !== stAudio) return;
+  el.src = url;
+  el.load();
+}
+
+// Source that can be assigned without awaiting the cache, so play() can still
+// happen inside the user interaction. null when only the cache can provide it.
+function stSyncSource(index) {
+  if (stObjectUrls[index]) return stObjectUrls[index];
+  const track = SOUNDTRACK[index];
+  if (!track || stCachedIds.has(track.id)) return null;
+  return stTrackUrl(index);
 }
 
 function updateSTDownloadUI(progress) {
@@ -557,13 +840,14 @@ async function downloadSTIfNeeded() {
       stCachedIds.add(SOUNDTRACK[trackIndex].id);
       localStorage.setItem("botse_audio:stCachedIds", JSON.stringify([...stCachedIds]));
 
-      // Si era la pista en reproducción, recargarla desde caché sin interrumpir
+      // Si era la pista en reproducción, recargarla desde caché sin interrumpir.
+      // Same element, so the enhanced graph is reused.
       if (trackIndex === stCurrentTrack && stAudio) {
         const wasPlaying = !stAudio.paused;
         const savedTime = stAudio.currentTime;
         await loadSTTrack(trackIndex);
-        stAudio.currentTime = savedTime;
-        if (wasPlaying) stAudio.play().catch(() => {});
+        seekSTWhenReady(savedTime);
+        if (wasPlaying) playST();
       }
     } catch (err) {
       console.warn("Soundtrack download failed:", url, err);
@@ -576,12 +860,13 @@ async function downloadSTIfNeeded() {
   return stDownloadPromise;
 }
 
+// Compatibility backend helpers (native element volume/mute).
 function setSTGain(value) {
-  if (stAudio && stCanSetVolume) stAudio.volume = value;
+  if (stAudio && stCanSetVolume && !stIsEnhanced()) stAudio.volume = value;
 }
 
 function getSTGain() {
-  if (stAudio && stCanSetVolume) return stAudio.volume;
+  if (stAudio && stCanSetVolume && !stIsEnhanced()) return stAudio.volume;
   return stVolume / 100;
 }
 
@@ -594,87 +879,78 @@ function setSTMuted(muted) {
 }
 
 // The fades run on a timer rather than requestAnimationFrame: rAF is frozen in
-// the background, which would strand the fade mid-way and, in duckSTFade, never
-// invoke the callback that starts the narration.
+// the background, which would strand the fade mid-way.
 const ST_FADE_STEP_MS = 50;
 
+function cancelSTFade() {
+  if (stFadeId) clearInterval(stFadeId);
+  stFadeId = 0;
+}
+
 function runSTFade(targetVol, durationMs, onDone) {
+  cancelSTFade();
   const startVol = getSTGain();
   const startTime = performance.now();
-  const id = setInterval(() => {
+  stFadeId = setInterval(() => {
     const t = Math.min((performance.now() - startTime) / durationMs, 1);
     setSTGain(startVol + (targetVol - startVol) * t);
     if (t >= 1) {
-      clearInterval(id);
+      cancelSTFade();
       setSTGain(targetVol);
-      onDone();
+      onDone?.();
     }
   }, ST_FADE_STEP_MS);
 }
 
-function duckST() {
-  if (stEnabled && stAudio) {
-    stIsDucked = true;
-    setSTMuted(true);
-  }
-}
-
-function duckSTFade(onDone) {
-  if (!stEnabled || !stAudio || stAudio.paused) {
-    onDone();
-    return;
-  }
+function duckSTNative() {
+  if (!stAudio || stIsDucked) return;
   stIsDucked = true;
-  if (!stCanSetVolume) {
+  if (stAudio.paused || !stCanSetVolume) {
+    cancelSTFade();
     setSTMuted(true);
-    onDone();
     return;
   }
-  // Where volume works, fade down first so the cut is not abrupt.
+  // Where volume works, fade down first so the cut is not abrupt. The
+  // narration is not held back waiting for it.
   runSTFade(0, 400, () => {
     if (!stIsDucked) return;
     setSTMuted(true);
     setSTGain(stVolume / 100);
-    onDone();
   });
 }
 
-function restoreST() {
-  if (stEnabled && stAudio) {
-    stIsDucked = false;
-    setSTMuted(false);
-    setSTGain(stVolume / 100);
-    if (!stAudio.paused) updateSTMediaSession(true);
-  }
-}
-
-function restoreSTFade() {
+function restoreSTNative() {
   stIsDucked = false;
-  if (!stEnabled || !stAudio) return;
+  if (!stAudio) return;
+  const targetVol = stVolume / 100;
   // Paused: no fade to run, just leave it unmuted and at full level so the next
   // play is not silent.
-  if (stAudio.paused) {
+  if (stAudio.paused || !stCanSetVolume) {
+    cancelSTFade();
     setSTMuted(false);
-    setSTGain(stVolume / 100);
-    return;
-  }
-  if (!stCanSetVolume) {
-    setSTMuted(false);
-    updateSTMediaSession(true);
+    setSTGain(targetVol);
     return;
   }
   // Fade up from silence so the music does not burst back in.
-  const targetVol = stVolume / 100;
   if (stAudio.muted) setSTGain(0);
   setSTMuted(false);
   if (getSTGain() >= targetVol) {
+    cancelSTFade();
     setSTGain(targetVol);
-    updateSTMediaSession(true);
     return;
   }
-  runSTFade(targetVol, 800, () => {
-    if (!stAudio.paused) updateSTMediaSession(true);
-  });
+  runSTFade(targetVol, 800);
+}
+
+// Applies the requested ducking to whichever backend is active.
+function applySTDuck(ducked) {
+  if (!stEnabled || !stAudio) return;
+  if (stGain) {
+    stGain.setDucked(ducked);
+    return;
+  }
+  if (ducked) duckSTNative();
+  else restoreSTNative();
 }
 
 function updateSTUI() {
@@ -721,7 +997,8 @@ function tickSTProgress() {
 
 // Barra de música de ambiente, persistente en la zona superior (independiente de
 // la sección). Mantiene los mismos IDs que usa la lógica de audio (updateSTUI,
-// tickSTProgress, updateSTDownloadUI…). Se renderiza y enlaza UNA sola vez.
+// tickSTProgress, updateSTDownloadUI…). Se enlaza UNA sola vez; se vuelve a
+// renderizar al cambiar de backend (visibilidad del volumen).
 function renderMusicBar() {
   if (!musicBarEl) return;
   const engaged = stEnabled && stAudio;
@@ -745,7 +1022,7 @@ function renderMusicBar() {
         <input type="range" class="mb-seekbar" id="st-seekbar" min="0" max="1000" value="0" step="1" aria-label="${escapeAttribute(t("soundtrackPlayer.seek"))}">
         <span class="mb-time" id="st-total-time">-:--</span>
       </div>
-      <div class="mb-volume"${stCanSetVolume ? "" : ' hidden'}>
+      <div class="mb-volume"${stSupportsVolumeControl() ? "" : ' hidden'}>
         <span class="mb-vol-icon" aria-hidden="true">${ICONS.speaker}</span>
         <input type="range" class="mb-volume-slider" id="st-volume" min="0" max="100" value="${stVolume}" step="1" aria-label="${escapeAttribute(t("soundtrackPlayer.volume"))}">
       </div>
@@ -761,34 +1038,59 @@ function renderMusicBar() {
 function engageMusic() {
   stEnabled = true;
   setupSTPlayer();
-  loadSTTrack(stCurrentTrack).then(() => {
-    stAudio?.play().catch(() => {});
-    updateSTMediaSession(true);
-    updateSTUI();
-  });
-  downloadSTIfNeeded();
   stopActivePlayer();
+  // Inside the click: lets iOS start the context before the cache lookup.
+  resumeSTContext("engage");
+  const start = () => {
+    playST({ userInitiated: true });
+    syncMediaSession();
+    updateSTUI();
+  };
+  const syncSrc = stSyncSource(stCurrentTrack);
+  if (syncSrc) {
+    // Synchronous so play() stays inside the user interaction on iOS.
+    stAudio.src = syncSrc;
+    stAudio.load();
+    start();
+  } else {
+    loadSTTrack(stCurrentTrack).then(start);
+  }
+  downloadSTIfNeeded();
   renderMusicBar();
   saveState();
   render(); // refresca el sidebar (el ajuste de audio ambiente puede haber cambiado)
   setTimeout(updateSTUI, 200);
 }
 
-function stPlayPause() {
-  if (!stEnabled || !stAudio) { engageMusic(); return; }
-  if (stAudio.paused) {
-    // Pressing play is an explicit request for music: it wins over any ducking
-    // still in place, which would otherwise start playback silently.
+// Explicit request for music (button or lock screen).
+function stPlay() {
+  if (!stAudio) return;
+  // Avoid playing both the soundtrack and a panel's ambient track together.
+  pauseMedia(activePlayer?.ambientEl);
+  if (!stIsEnhanced()) {
+    // Compatibility mode cannot lower the soundtrack without muting it:
+    // pause an active narration so pressing music play never overlaps voice.
+    if (activePlayer?.playing) pauseNarration(activePlayer);
+    cancelSTFade();
     stIsDucked = false;
     setSTMuted(false);
     setSTGain(stVolume / 100);
-    stAudio.play().catch(() => {});
-    updateSTMediaSession(true);
-  } else {
-    stAudio.pause();
-    updateSTMediaSession(false);
   }
+  playST({ userInitiated: true });
+  syncMediaSession();
   updateSTUI();
+}
+
+function stPause() {
+  stPlayIntent = false;
+  stAudio?.pause();
+  syncMediaSession();
+  updateSTUI();
+}
+
+function stPlayPause() {
+  if (!stEnabled || !stAudio) { engageMusic(); return; }
+  if (stAudio.paused) stPlay(); else stPause();
 }
 
 function stPrev() {
@@ -797,14 +1099,14 @@ function stPrev() {
   if (stAudio.currentTime > 3) {
     stAudio.currentTime = 0;
     updateSTUI();
-    if (wasPlaying) updateSTMediaSession(true);
+    syncMediaSession();
   } else {
     stCurrentTrack = (stCurrentTrack - 1 + SOUNDTRACK.length) % SOUNDTRACK.length;
     loadSTTrack(stCurrentTrack).then(() => {
-      if (wasPlaying) stAudio.play().catch(() => {});
+      if (wasPlaying) playST();
       updateSTUI();
       saveState();
-      if (wasPlaying) updateSTMediaSession(true);
+      syncMediaSession();
     });
   }
 }
@@ -814,11 +1116,85 @@ function stNext() {
   const wasPlaying = !stAudio.paused;
   stCurrentTrack = (stCurrentTrack + 1) % SOUNDTRACK.length;
   loadSTTrack(stCurrentTrack).then(() => {
-    if (wasPlaying) stAudio.play().catch(() => {});
+    if (wasPlaying) playST();
     updateSTUI();
     saveState();
-    if (wasPlaying) updateSTMediaSession(true);
+    syncMediaSession();
   });
+}
+
+// Switches between the compatibility and enhanced backends. Must be called
+// from a user interaction: the new element (and, in enhanced mode, its
+// context) has to be started by it. Track, position, volume and whether the
+// music was playing are preserved.
+function setSoundtrackMode(requested) {
+  stAudioMode = requested === SOUNDTRACK_MODES.ENHANCED ? SOUNDTRACK_MODES.ENHANCED : SOUNDTRACK_MODES.COMPAT;
+  saveState();
+  const next = resolveSTMode();
+  if (next === stActiveMode) return;
+
+  const snapshot = stAudio ? { time: stAudio.currentTime || 0, wasPlaying: !stAudio.paused } : null;
+  logAudio("st:mode-switch", { from: stActiveMode, to: next, ...snapshot });
+  teardownSTPlayer();
+  stActiveMode = next;
+  setAudioSessionType(stIsEnhanced() ? "playback" : "auto");
+
+  if (stEnabled && snapshot) {
+    setupSTPlayer();
+    if (stGain) {
+      // Created here, inside the interaction; fading in hides the moment
+      // before the seek lands.
+      stGain.ensure({ fadeInMs: RESTORE_RAMP_MS });
+    } else if (snapshot.time > 0) {
+      // Native output: stay muted until the saved position is reached.
+      const el = stAudio;
+      const unmute = () => { if (el === stAudio) el.muted = stIsDucked; };
+      el.muted = true;
+      el.addEventListener("seeked", unmute, { once: true, signal: stListeners.signal });
+      el.addEventListener("error", unmute, { once: true, signal: stListeners.signal });
+    }
+    const start = () => {
+      seekSTWhenReady(snapshot.time);
+      if (snapshot.wasPlaying) {
+        playST({ userInitiated: true, failureMessage: t("audio.modeRestartFailed") });
+      }
+      updateSTUI();
+      syncMediaSession();
+    };
+    const syncSrc = stSyncSource(stCurrentTrack);
+    if (syncSrc) {
+      // Synchronous so play() stays inside the user interaction.
+      stAudio.src = syncSrc;
+      stAudio.load();
+      start();
+    } else {
+      resumeSTContext("mode-switch");
+      loadSTTrack(stCurrentTrack).then(start);
+    }
+  }
+  renderMusicBar();
+  updateSTUI();
+  syncMediaSession();
+}
+
+// Foreground return: reconcile the context and UI without restarting music
+// the user (or the system, e.g. a call) paused, and without retry loops.
+function reconcileSTAfterWake() {
+  if (!stEnabled || !stAudio) return;
+  logAudio("st:wake", { intent: stPlayIntent });
+  if (stGain && stGain.isConnected && stGain.contextState !== "running") {
+    const gain = stGain;
+    gain.resume().then((running) => {
+      logAudio("st:wake-resume", { running });
+      if (!running && gain === stGain && stAudio && !stAudio.paused) showAudioNotice(t("audio.musicInterrupted"));
+    }, (err) => logAudio("st:ctx-error", { reason: "wake", message: String(err?.message || err) }));
+  } else if (stGain && stPlayIntent && stAudio.paused) {
+    // Stopped while in the background (enhanced mode): offer recovery.
+    showAudioNotice(t("audio.musicInterrupted"));
+  }
+  applySTDuck(narrationDucking.snapshot().ducked);
+  updateSTUI();
+  syncMediaSession();
 }
 
 // Eventos de la barra de música. Delegación sobre el contenedor persistente:
@@ -851,67 +1227,100 @@ function bindMusicBarEvents() {
   musicBarEl.addEventListener("input", (event) => {
     if (event.target.id !== "st-volume") return;
     stVolume = parseInt(event.target.value, 10);
-    // While ducked the element is muted, so the new level simply becomes the
-    // one restored when the narration ends.
-    setSTGain(stVolume / 100);
+    if (stGain) {
+      // Only the selected level changes; an active duck stays at 20% of it.
+      stGain.setVolume(stVolume / 100);
+    } else if (!(stIsDucked && stFadeId)) {
+      // A running duck fade ends muted at the new level on its own; otherwise
+      // (including a restore fade) jump to the new level. While mute-ducked it
+      // simply becomes the level heard once restored.
+      cancelSTFade();
+      setSTGain(stVolume / 100);
+    }
     saveState();
   });
 }
 
-function updateSTMediaSession(playing) {
-  if (!("mediaSession" in navigator) || !SOUNDTRACK.length) return;
+// ── Media Session (lock screen / headphones) ──────────────
+// A single owner at a time: the open narration, or else the music.
+let mediaSessionKey = "";
+
+function stMediaMetadata() {
   const base = import.meta.env.BASE_URL;
-  if (playing) {
-    navigator.mediaSession.metadata = new MediaMetadata({
-      title: SOUNDTRACK[stCurrentTrack]?.title ?? t("soundtrackPlayer.fallbackTitle"),
-      artist: t("app.mediaArtist"),
-      artwork: [
-        { src: `${base}icons/icon-192.png`, sizes: "192x192", type: "image/png" },
-        { src: `${base}icons/icon-512.png`, sizes: "512x512", type: "image/png" },
-      ]
+  return new MediaMetadata({
+    title: SOUNDTRACK[stCurrentTrack]?.title ?? t("soundtrackPlayer.fallbackTitle"),
+    artist: t("app.mediaArtist"),
+    artwork: [
+      { src: `${base}icons/icon-192.png`, sizes: "192x192", type: "image/png" },
+      { src: `${base}icons/icon-512.png`, sizes: "512x512", type: "image/png" },
+    ]
+  });
+}
+
+// Lock-screen state the app wants, or null when nothing owns the controls.
+function desiredMediaPlaybackState() {
+  const { owner } = narrationDucking.snapshot();
+  if (owner === "narration" && activePlayer) return activePlayer.playing ? "playing" : "paused";
+  if (stEnabled && stAudio && SOUNDTRACK.length) return stAudio.paused ? "paused" : "playing";
+  return null;
+}
+
+// WebKit also rewrites playbackState to "paused" asynchronously after a
+// media element pauses (e.g. the narration that just handed the controls back
+// to the music), so the state is re-asserted once after the current task.
+let mediaSessionRecheckId = 0;
+
+function scheduleMediaSessionRecheck() {
+  if (mediaSessionRecheckId) return;
+  mediaSessionRecheckId = setTimeout(() => {
+    mediaSessionRecheckId = 0;
+    const desired = desiredMediaPlaybackState();
+    const ms = navigator.mediaSession;
+    if (desired && ms.playbackState !== desired) {
+      logAudio("mediasession:reassert", { from: ms.playbackState, to: desired });
+      try { ms.playbackState = desired; } catch {}
+    }
+  }, 0);
+}
+
+function syncMediaSession() {
+  if (!("mediaSession" in navigator)) return;
+  const ms = navigator.mediaSession;
+  const { owner } = narrationDucking.snapshot();
+  const p = activePlayer;
+  const playbackState = desiredMediaPlaybackState();
+
+  if (owner === "narration" && p) {
+    const key = `narration:${p.uid}`;
+    applyMediaSessionControls(ms, {
+      metadata: key === mediaSessionKey ? undefined : p.mediaMetadata,
+      playbackState,
+      handlers: {
+        play: () => startNarration(activePlayer),
+        pause: () => pauseNarration(activePlayer),
+        stop: () => stopActivePlayer(),
+      },
     });
-    navigator.mediaSession.setActionHandler("play", () => {
-      stIsDucked = false;
-      setSTMuted(false);
-      setSTGain(stVolume / 100);
-      stAudio?.play().catch(() => {});
-      updateSTUI();
-      updateSTMediaSession(true);
+    mediaSessionKey = key;
+  } else if (playbackState) {
+    const key = `music:${stCurrentTrack}`;
+    applyMediaSessionControls(ms, {
+      metadata: key === mediaSessionKey ? undefined : stMediaMetadata(),
+      playbackState,
+      handlers: {
+        play: stPlay,
+        pause: stPause,
+        previoustrack: stPrev,
+        nexttrack: stNext,
+      },
     });
-    navigator.mediaSession.setActionHandler("pause", () => {
-      stAudio?.pause();
-      stopSTPoll();
-      updateSTUI();
-      navigator.mediaSession.playbackState = "paused";
-    });
-    navigator.mediaSession.setActionHandler("previoustrack", () => {
-      if (!stAudio) return;
-      const wasPlaying = !stAudio.paused;
-      if (stAudio.currentTime > 3) {
-        stAudio.currentTime = 0;
-        updateSTUI();
-        updateSTMediaSession(true);
-      } else {
-        stCurrentTrack = (stCurrentTrack - 1 + SOUNDTRACK.length) % SOUNDTRACK.length;
-        loadSTTrack(stCurrentTrack).then(() => {
-          if (wasPlaying) stAudio.play().catch(() => {});
-          updateSTUI();
-          updateSTMediaSession(true);
-        });
-      }
-    });
-    navigator.mediaSession.setActionHandler("nexttrack", () => {
-      if (!stAudio) return;
-      const wasPlaying = !stAudio.paused;
-      stCurrentTrack = (stCurrentTrack + 1) % SOUNDTRACK.length;
-      loadSTTrack(stCurrentTrack).then(() => {
-        if (wasPlaying) stAudio.play().catch(() => {});
-        updateSTUI();
-        updateSTMediaSession(true);
-      });
-    });
+    mediaSessionKey = key;
+  } else {
+    applyMediaSessionControls(ms, { metadata: null, playbackState: "none" });
+    mediaSessionKey = "";
+    return;
   }
-  navigator.mediaSession.playbackState = playing ? "playing" : "paused";
+  scheduleMediaSessionRecheck();
 }
 
 // Barra de música de ambiente (persistente en la zona superior).
@@ -1431,33 +1840,33 @@ document.addEventListener("keydown", (e) => {
 if (stEnabled) {
   setupSTPlayer();
   loadSTTrack(stCurrentTrack).then(() => {
-    if (stRestoreTime > 0) {
-      if (isFinite(stAudio.duration) && stAudio.duration > 0) {
-        stAudio.currentTime = stRestoreTime;
-        stRestoreTime = 0;
-      } else {
-        const seekOnce = () => {
-          stAudio.currentTime = stRestoreTime;
-          stRestoreTime = 0;
-          stAudio.removeEventListener("loadedmetadata", seekOnce);
-        };
-        stAudio.addEventListener("loadedmetadata", seekOnce);
-      }
-    }
-    stAudio?.play().catch(() => {});
+    seekSTWhenReady(stRestoreTime);
+    stRestoreTime = 0;
+    // Usually rejected without a user interaction (iOS); the play button or
+    // the lock screen starts it then.
+    playST();
     updateSTUI();
-    updateSTMediaSession(true);
+    syncMediaSession();
   });
   downloadSTIfNeeded();
 }
 
 window.addEventListener("pagehide", () => {
   saveState();
+  flushAudioDiag();
 });
 
+// Hiding the page never pauses or suspends anything (iOS fires this when the
+// screen locks); coming back reconciles players the system may have stopped.
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) saveState();
-  else if (activePlayer?.playing) resyncActivePlayerAfterWake();
+  logAudio(document.hidden ? "page:hidden" : "page:visible");
+  if (document.hidden) {
+    saveState();
+    flushAudioDiag();
+    return;
+  }
+  if (activePlayer?.playing) resyncActivePlayerAfterWake();
+  reconcileSTAfterWake();
 });
 
 function registerServiceWorker() {
@@ -1641,6 +2050,16 @@ function renderSidebar() {
 
   const inicioActive = view === "inicio";
 
+  // Opt-in iOS mixing mode (plus the diagnostics export used to evaluate it).
+  const enhancedMixingHtml = stEnhancedOffered
+    ? `<label class="sidebar-ctrl-label">
+            <input type="checkbox" id="st-enhanced-checkbox" class="autoplay-checkbox"${stAudioMode === SOUNDTRACK_MODES.ENHANCED ? " checked" : ""} aria-describedby="st-enhanced-hint">
+            <span>${escapeHtml(t("sidebar.enhancedMixing"))}</span>
+          </label>
+          <p class="sidebar-section-hint" id="st-enhanced-hint">${escapeHtml(t("sidebar.enhancedMixingHint"))}</p>
+          <button type="button" class="checkable-chip" data-audio-diagnostics>${escapeHtml(t("sidebar.audioDiagnostics"))}</button>`
+    : "";
+
   return `
     <nav class="sidebar-nav" aria-label="${escapeAttribute(t("a11y.sidebarNav"))}">
       <button type="button" class="sidebar-close" data-sidebar-close aria-label="${escapeAttribute(t("a11y.closeSidebar"))}">${ICONS.close}</button>
@@ -1670,6 +2089,7 @@ function renderSidebar() {
             <span>${escapeHtml(t("sidebar.autoplay"))}</span>
           </label>
           <div class="sidebar-speed">${speedChips}</div>
+          ${enhancedMixingHtml}
         </div>
       </div>
       <div class="sidebar-divider"></div>
@@ -1712,6 +2132,19 @@ function bindConfigEvents() {
       saveState();
     });
   }
+
+  // Applied from the change event itself: the new soundtrack element (and its
+  // context) has to be started by this interaction.
+  const enhancedCheckbox = document.getElementById("st-enhanced-checkbox");
+  if (enhancedCheckbox) {
+    enhancedCheckbox.addEventListener("change", () => {
+      setSoundtrackMode(enhancedCheckbox.checked ? SOUNDTRACK_MODES.ENHANCED : SOUNDTRACK_MODES.COMPAT);
+    });
+  }
+
+  document.querySelector("[data-audio-diagnostics]")?.addEventListener("click", () => {
+    exportAudioDiagnostics();
+  });
 
   const recognizerConfirmCheckbox = document.getElementById("recognizer-confirm-card-checkbox");
   if (recognizerConfirmCheckbox) {
@@ -1899,23 +2332,32 @@ function formatTimeLong(secs) {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
+// WebKit sets mediaSession.playbackState to "paused" on every pause() call,
+// even on an element that is already paused, which would overwrite the state
+// just handed back to the music. Only pause what is actually playing.
+function pauseMedia(el) {
+  if (el && !el.paused) el.pause();
+}
+
 function stopActivePlayer() {
   if (!activePlayer) return;
-  if ("mediaSession" in navigator) {
-    navigator.mediaSession.metadata = null;
-    navigator.mediaSession.playbackState = "none";
-  }
-  restoreSTFade();
-  stopPlayerTick(activePlayer);
-  activePlayer.playing = false;
-  activePlayer.panelEl.pause();
-  if (activePlayer.ambientEl) activePlayer.ambientEl.pause();
+  const p = activePlayer;
   activePlayer = null;
+  p.playSeq++;
+  p.playing = false;
+  p.listeners.abort();
+  stopPlayerTick(p);
+  pauseMedia(p.panelEl);
+  pauseMedia(p.ambientEl);
+  // Restores the music and hands the lock-screen controls back to it.
+  narrationDucking.detach(p.token);
 }
 
 // The player loop uses a timer, not requestAnimationFrame: rAF is frozen while
 // the screen is locked or the tab is in the background, which left the state
-// machine (pre-roll → narration → fade-out) stuck halfway.
+// machine (pre-roll → narration → fade-out) stuck halfway. It only drives the
+// UI and the ambient pre-roll/fade-out; ducking restoration relies on media
+// events instead.
 const PLAYER_TICK_MS = 200;
 
 function startPlayerTick(p) {
@@ -1929,22 +2371,162 @@ function stopPlayerTick(p) {
   p.tickId = 0;
 }
 
+// Ambient beds (e.g. ambient/general.mp3) are pre-attenuated by -12 dB so
+// native <audio> plays softly behind narrations even on iOS, where
+// HTMLMediaElement.volume is ignored.
+const AMBIENT_VOLUME = 1;
+
+// Every narration play() goes through here. A rejection only counts if it
+// belongs to the current player and the current start request, so a late
+// promise from an older narration (or one superseded by a pause) is ignored.
+function playNarrationMedia(p, el) {
+  if (!el) return;
+  if (el === p.ambientEl && stAudio && !stAudio.paused) return;
+  const seq = p.playSeq;
+  const critical = el === p.panelEl;
+  let playing;
+  try {
+    playing = Promise.resolve(el.play());
+  } catch (err) {
+    playing = Promise.reject(err);
+  }
+  playing.catch((err) => {
+    if (activePlayer !== p || seq !== p.playSeq || !p.playing) return;
+    logAudio("narration:play-rejected", { name: err?.name, message: err?.message, role: el.dataset?.role });
+    if (err?.name === "AbortError" || !critical) return;
+    failNarration(p, err);
+  });
+}
+
+// Folds the running pre-roll/fade-out clock into its accumulated position.
+function holdNarrationClock(p) {
+  if (!p.hasAmbient || p.phaseStartMs == null) return;
+  if (p.phase === "pre-roll") {
+    const elapsed = (performance.now() - p.phaseStartMs) / 1000 / p.panelEl.playbackRate;
+    p.preRollPosAtStart = Math.min(1, p.preRollPosAtStart + elapsed);
+  } else if (p.phase === "fade-out") {
+    const elapsed = (performance.now() - p.phaseStartMs) / 1000 / (p.ambientEl?.playbackRate || 1);
+    p.fadeOutPosAtStart = Math.min(1, p.fadeOutPosAtStart + elapsed);
+  }
+  p.phaseStartMs = null;
+}
+
+function enterFadeOut(p) {
+  p.phase = "fade-out";
+  p.fadeOutPosAtStart = 0;
+  p.phaseStartMs = performance.now();
+  if (p.ambientEl) p.ambientEl.volume = AMBIENT_VOLUME;
+}
+
+// Start, resume or replay. Called synchronously from the interaction (panel
+// open, play button, lock screen) so iOS accepts play(); the music is ducked
+// at the same time rather than before.
+function startNarration(p) {
+  if (!p || activePlayer !== p || p.playing) return;
+  p.playSeq++;
+  const ended = p.phase === "ended" || (!p.hasAmbient && p.panelEl.ended);
+
+  if (p.hasAmbient) {
+    if (ended) {
+      if (p.ambientEl) { p.ambientEl.volume = AMBIENT_VOLUME; p.ambientEl.currentTime = 0; }
+      p.panelEl.currentTime = 0;
+      p.phase = "pre-roll";
+      p.preRollPosAtStart = 0;
+      p.fadeOutPosAtStart = 0;
+    }
+    if (p.phase === "pre-roll") {
+      p.phaseStartMs = performance.now();
+      playNarrationMedia(p, p.ambientEl);
+    } else if (p.phase === "playing") {
+      playNarrationMedia(p, p.ambientEl);
+      playNarrationMedia(p, p.panelEl);
+    } else if (p.phase === "fade-out") {
+      p.phaseStartMs = performance.now();
+      if (p.ambientEl) p.ambientEl.volume = Math.max(0, AMBIENT_VOLUME * (1 - p.fadeOutPosAtStart));
+      playNarrationMedia(p, p.ambientEl);
+    }
+  } else {
+    if (ended) {
+      p.panelEl.currentTime = 0;
+      p.phase = "playing";
+    }
+    playNarrationMedia(p, p.panelEl);
+  }
+
+  p.playing = true;
+  startPlayerTick(p);
+  setPlayerBtnState(p.playerEl, true);
+  // The voice is over during the ambient fade-out: nothing to duck for.
+  if (p.phase !== "fade-out") narrationDucking.play(p.token);
+  // An explicit play is also a chance to restart a stalled music context.
+  resumeSTContext("narration-play");
+  syncMediaSession();
+}
+
+function pauseNarration(p) {
+  if (!p || activePlayer !== p || !p.playing) return;
+  p.playSeq++;
+  stopPlayerTick(p);
+  holdNarrationClock(p);
+  p.playing = false;
+  pauseMedia(p.ambientEl);
+  pauseMedia(p.panelEl);
+  setPlayerBtnState(p.playerEl, false);
+  narrationDucking.pause(p.token);
+  syncMediaSession();
+}
+
+// Natural end of the whole player (after the ambient fade-out, if any).
+// Idempotent: the `ended` event, the timer and the wake resync may all get here.
+function finishNarration(p, source) {
+  if (!p || activePlayer !== p || p.phase === "ended") return false;
+  p.playSeq++;
+  stopPlayerTick(p);
+  if (p.ambientEl) { p.ambientEl.volume = 0; pauseMedia(p.ambientEl); }
+  p.playing = false;
+  p.phase = "ended";
+  updatePlayerUI(p, p.totalDuration);
+  setPlayerBtnState(p.playerEl, false);
+  logAudio("narration:complete", { source });
+  narrationDucking.finish(p.token);
+  syncMediaSession();
+  return true;
+}
+
+// Rejected playback or terminal media error: stop, restore the music and tell
+// the user. A later press on play retries.
+function failNarration(p, err) {
+  if (!p || activePlayer !== p) return;
+  p.playSeq++;
+  stopPlayerTick(p);
+  holdNarrationClock(p);
+  p.playing = false;
+  pauseMedia(p.ambientEl);
+  pauseMedia(p.panelEl);
+  setPlayerBtnState(p.playerEl, false);
+  if (narrationDucking.fail(p.token)) {
+    showAudioNotice(err?.name === "NotAllowedError" ? t("audio.narrationBlocked") : t("audio.narrationFailed"));
+  }
+  syncMediaSession();
+}
+
 // After returning from the background the timer may have been suspended: the
 // state is recomputed immediately and any element paused by the system is
 // resumed.
 function resyncActivePlayerAfterWake() {
   const p = activePlayer;
   if (!p || !p.playing) return;
+  logAudio("narration:wake");
   if (p.hasAmbient) {
     if ((p.phase === "pre-roll" || p.phase === "fade-out") && p.ambientEl?.paused) {
-      p.ambientEl.play().catch(() => {});
+      playNarrationMedia(p, p.ambientEl);
     }
     if (p.phase === "playing") {
-      if (p.ambientEl?.paused) p.ambientEl.play().catch(() => {});
-      if (p.panelEl.paused && !p.panelEl.ended) p.panelEl.play().catch(() => {});
+      if (p.ambientEl?.paused) playNarrationMedia(p, p.ambientEl);
+      if (p.panelEl.paused && !p.panelEl.ended) playNarrationMedia(p, p.panelEl);
     }
   } else if (p.panelEl.paused && !p.panelEl.ended) {
-    p.panelEl.play().catch(() => {});
+    playNarrationMedia(p, p.panelEl);
   }
   startPlayerTick(p);
   playerTick();
@@ -1964,33 +2546,23 @@ function playerTick() {
         p.phase = "playing";
         p.preRollPosAtStart = 0;
         p.phaseStartMs = null;
-        p.panelEl.play().catch(() => {});
+        playNarrationMedia(p, p.panelEl);
       }
     } else if (p.phase === "playing") {
       vt = p.panelEl.currentTime + 1;
       // Guard: panel ended before event fired
       if (p.panelEl.ended) {
-        p.phase = "fade-out";
-        p.fadeOutPosAtStart = 0;
-        p.phaseStartMs = performance.now();
-        if (p.ambientEl) p.ambientEl.volume = 0.25;
+        enterFadeOut(p);
+        narrationDucking.finish(p.token);
       }
     } else if (p.phase === "fade-out") {
       const elapsed = (performance.now() - p.phaseStartMs) / 1000 / (p.ambientEl?.playbackRate || 1);
       const pos = p.fadeOutPosAtStart + elapsed;
       vt = p.panelDuration + 1 + pos;
-      // Fade ambient volume: 0.3 → 0 over 1 second
-      if (p.ambientEl) p.ambientEl.volume = Math.max(0, 0.25 * (1 - pos));
+      // Fade ambient volume down to 0 over 1 second
+      if (p.ambientEl) p.ambientEl.volume = Math.max(0, AMBIENT_VOLUME * (1 - pos));
       if (pos >= 1) {
-        vt = p.totalDuration;
-        if (p.ambientEl) { p.ambientEl.volume = 0; p.ambientEl.pause(); }
-        updatePlayerUI(p, vt);
-        setPlayerBtnState(p.playerEl, false);
-        p.playing = false;
-        updateMediaSession(false);
-        restoreSTFade();
-        stopPlayerTick(p);
-        p.phase = "ended";
+        finishNarration(p, "tick");
         return;
       }
     } else {
@@ -2000,14 +2572,7 @@ function playerTick() {
   } else {
     vt = p.panelEl.currentTime;
     if (p.panelEl.ended) {
-      vt = p.totalDuration;
-      updatePlayerUI(p, vt);
-      setPlayerBtnState(p.playerEl, false);
-      p.playing = false;
-      updateMediaSession(false);
-      restoreSTFade();
-      stopPlayerTick(p);
-      p.phase = "ended";
+      finishNarration(p, "tick");
       return;
     }
   }
@@ -2036,290 +2601,191 @@ function setPlayerBtnState(playerEl, isPlaying) {
 function seekPlayer(vt) {
   if (!activePlayer) return;
   const p = activePlayer;
+  if (!(p.totalDuration > 0)) return;
   const clamped = Math.max(0, Math.min(vt, p.totalDuration));
 
   stopPlayerTick(p);
 
-  const wasPlaying = p.hasAmbient
-    ? !(p.ambientEl?.paused ?? true)
-    : !p.panelEl.paused;
+  const wasPlaying = p.playing;
 
   if (p.hasAmbient) {
     if (clamped < 1) {
       // pre-roll zone
-      p.panelEl.pause();
+      pauseMedia(p.panelEl);
       p.panelEl.currentTime = 0;
-      if (p.ambientEl) p.ambientEl.volume = 0.25;
+      if (p.ambientEl) p.ambientEl.volume = AMBIENT_VOLUME;
       p.phase = "pre-roll";
       p.preRollPosAtStart = clamped;
       p.phaseStartMs = wasPlaying ? performance.now() : null;
-      if (wasPlaying && p.ambientEl?.paused) p.ambientEl.play().catch(() => {});
+      if (wasPlaying && p.ambientEl?.paused) playNarrationMedia(p, p.ambientEl);
     } else if (clamped <= p.panelDuration + 1) {
       // playing zone
       p.panelEl.currentTime = clamped - 1;
-      if (p.ambientEl) p.ambientEl.volume = 0.25;
+      if (p.ambientEl) p.ambientEl.volume = AMBIENT_VOLUME;
       p.phase = "playing";
       p.phaseStartMs = null;
       if (wasPlaying) {
-        if (p.ambientEl?.paused) p.ambientEl.play().catch(() => {});
-        if (p.panelEl.paused) p.panelEl.play().catch(() => {});
+        if (p.ambientEl?.paused) playNarrationMedia(p, p.ambientEl);
+        if (p.panelEl.paused) playNarrationMedia(p, p.panelEl);
       }
     } else {
       // fade-out zone
       const fadeOutPos = clamped - (p.panelDuration + 1);
-      p.panelEl.pause();
+      pauseMedia(p.panelEl);
       p.phase = "fade-out";
       p.fadeOutPosAtStart = fadeOutPos;
       p.phaseStartMs = wasPlaying ? performance.now() : null;
-      if (p.ambientEl) p.ambientEl.volume = Math.max(0, 0.25 * (1 - fadeOutPos));
-      if (wasPlaying && p.ambientEl?.paused) p.ambientEl.play().catch(() => {});
+      if (p.ambientEl) p.ambientEl.volume = Math.max(0, AMBIENT_VOLUME * (1 - fadeOutPos));
+      if (wasPlaying && p.ambientEl?.paused) playNarrationMedia(p, p.ambientEl);
     }
   } else {
     p.panelEl.currentTime = clamped;
-    p.phase = clamped < p.totalDuration ? "playing" : "ended";
-    if (wasPlaying && p.panelEl.paused) p.panelEl.play().catch(() => {});
+    // Completion is left to the `ended` event / timer so it runs only once.
+    p.phase = "playing";
+    if (wasPlaying && p.panelEl.paused) playNarrationMedia(p, p.panelEl);
   }
 
   if (wasPlaying) {
+    // Seeking keeps (or, after the voice ended, re-applies) the ducking.
+    if (p.phase !== "fade-out") narrationDucking.play(p.token);
     startPlayerTick(p);
   } else {
     updatePlayerUI(p, clamped);
   }
+  // Pausing the voice while seeking into the pre-roll/fade-out resets the
+  // lock-screen state on WebKit.
+  syncMediaSession();
 }
 
-function updateMediaSession(playing) {
-  if (!("mediaSession" in navigator)) return;
-  navigator.mediaSession.playbackState = playing ? "playing" : "paused";
-}
+const NARRATION_LOGGED_EVENTS = ["play", "playing", "pause", "waiting", "stalled", "seeking", "seeked", "ended", "error"];
+let narrationPlayerUid = 0;
 
-function pauseActivePlayerInternal() {
-  if (!activePlayer) return;
-  const p = activePlayer;
-  stopPlayerTick(p);
-  if (p.hasAmbient) {
-    if (p.phase === "pre-roll") {
-      const elapsed = (performance.now() - p.phaseStartMs) / 1000 / p.panelEl.playbackRate;
-      p.preRollPosAtStart = Math.min(1, p.preRollPosAtStart + elapsed);
-      p.phaseStartMs = null;
-    } else if (p.phase === "fade-out") {
-      const elapsed = (performance.now() - p.phaseStartMs) / 1000 / (p.ambientEl?.playbackRate || 1);
-      p.fadeOutPosAtStart = Math.min(1, p.fadeOutPosAtStart + elapsed);
-      p.phaseStartMs = null;
-    }
-    p.ambientEl?.pause();
-  }
-  p.playing = false;
-  p.panelEl.pause();
-  setPlayerBtnState(p.playerEl, false);
-  updateMediaSession(false);
-  restoreSTFade();
-}
-
-function resumeActivePlayerInternal() {
-  if (!activePlayer) return;
-  const p = activePlayer;
-  if (p.hasAmbient) {
-    if (p.phase === "pre-roll") {
-      p.phaseStartMs = performance.now();
-      p.ambientEl?.play().catch(() => {});
-    } else if (p.phase === "playing") {
-      p.ambientEl?.play().catch(() => {});
-      p.panelEl.play().catch(() => {});
-    } else if (p.phase === "fade-out") {
-      p.phaseStartMs = performance.now();
-      if (p.ambientEl) {
-        p.ambientEl.volume = Math.max(0, 0.25 * (1 - p.fadeOutPosAtStart));
-        p.ambientEl.play().catch(() => {});
-      }
-    }
-  } else {
-    if (!p.panelEl.ended) p.panelEl.play().catch(() => {});
-  }
-  p.playing = true;
-  startPlayerTick(p);
-  setPlayerBtnState(p.playerEl, true);
-  updateMediaSession(true);
-  duckST();
-}
-
-function initPlayer(contentEl, panelEl, ambientEl, totalDuration, panelDuration) {
+// Creates the player as soon as the panel opens, before the metadata is
+// known, so playback can start from the interaction itself. The duration-
+// dependent UI (total time, seekbar) is filled in when it arrives.
+function attachPlayer(contentEl, panelEl, ambientEl) {
   const playerEl = contentEl.querySelector(".custom-player");
-  if (!playerEl) return;
+  if (!playerEl) return null;
 
+  stopActivePlayer();
   const hasAmbient = !!ambientEl;
+  const listeners = new AbortController();
+  const { signal } = listeners;
+  const title = contentEl.closest(".panel")?.querySelector(".panel-title")?.textContent?.trim() || t("app.mediaFallbackTitle");
 
-  activePlayer = {
+  const p = {
+    uid: ++narrationPlayerUid,
+    token: 0,
     tickId: 0,
+    playSeq: 0,
+    recoveredSeq: -1,        // playSeq whose OS pause was already retried
+    listeners,
     playerEl,
     panelEl,
     ambientEl: ambientEl || null,
     hasAmbient,
-    totalDuration,
-    panelDuration,
+    totalDuration: 0,
+    panelDuration: 0,
     phase: hasAmbient ? "pre-roll" : "playing",
     phaseStartMs: null,      // null = not yet started / paused
     preRollPosAtStart: 0,    // accumulated pre-roll seconds (0..1) at last pause
     fadeOutPosAtStart: 0,    // accumulated fade-out seconds (0..1) at last pause
     isSeeking: false,
     playing: false,
+    mediaMetadata: typeof MediaMetadata === "function" ? new MediaMetadata({ title, artist: t("app.mediaArtist") }) : null,
   };
+  activePlayer = p;
+  p.token = narrationDucking.attach();
 
-  // Set up audio volumes and rates
+  // Set up audio volumes and rates (narration speed is independent of the music)
   panelEl.volume = 1;
   panelEl.playbackRate = playbackRate;
   if (ambientEl) {
-    ambientEl.volume = 0.25;
+    ambientEl.volume = AMBIENT_VOLUME;
     ambientEl.playbackRate = playbackRate;
   }
 
-  // Update total time display
-  const totalEl = playerEl.querySelector("[data-player-total]");
-  if (totalEl) totalEl.textContent = formatTime(totalDuration);
-
-  // Enable seekbar
   const seekbar = playerEl.querySelector("[data-player-seek]");
-  if (seekbar) seekbar.removeAttribute("disabled");
+  const readDuration = () => {
+    if (activePlayer !== p) return;
+    const duration = panelEl.duration;
+    if (!isFinite(duration) || duration <= 0) return;
+    p.panelDuration = duration;
+    p.totalDuration = hasAmbient ? duration + 2 : duration;
+    const totalEl = playerEl.querySelector("[data-player-total]");
+    if (totalEl) totalEl.textContent = formatTime(p.totalDuration);
+    if (seekbar) seekbar.removeAttribute("disabled");
+  };
+  readDuration();
+  panelEl.addEventListener("loadedmetadata", readDuration, { signal });
+  panelEl.addEventListener("durationchange", readDuration, { signal });
 
-  // Panel ended → enter fade-out phase (Modo A). No { once } so replays also trigger it.
-  if (hasAmbient) {
-    panelEl.addEventListener("ended", () => {
-      if (!activePlayer || activePlayer.panelEl !== panelEl) return;
-      if (activePlayer.phase !== "playing") return;
-      activePlayer.phase = "fade-out";
-      activePlayer.fadeOutPosAtStart = 0;
-      activePlayer.phaseStartMs = performance.now();
-      if (activePlayer.ambientEl) activePlayer.ambientEl.volume = 0.25;
-      startPlayerTick(activePlayer);
-    });
+  for (const type of NARRATION_LOGGED_EVENTS) {
+    panelEl.addEventListener(type, () => logAudio(`narration:media-${type}`, type === "error" ? { code: panelEl.error?.code } : undefined), { signal });
   }
 
-  // Recover from unexpected OS-level pause (volume buttons, audio focus loss, Bluetooth, etc.)
-  panelEl.addEventListener("pause", () => {
-    if (!activePlayer || activePlayer.panelEl !== panelEl) return;
-    if (!activePlayer.playing || panelEl.ended) return;
-    panelEl.play().catch(() => {});
-  });
-
-  // Register MediaSession metadata and action handlers for OS media controls
-  if ("mediaSession" in navigator) {
-    const title = contentEl.closest(".panel")?.querySelector(".panel-title")?.textContent?.trim() || t("app.mediaFallbackTitle");
-    navigator.mediaSession.metadata = new MediaMetadata({ title, artist: t("app.mediaArtist") });
-    navigator.mediaSession.setActionHandler("play", () => playerEl.querySelector("[data-player-play]")?.click());
-    navigator.mediaSession.setActionHandler("pause", () => playerEl.querySelector("[data-player-play]")?.click());
-    navigator.mediaSession.setActionHandler("stop", () => stopActivePlayer());
-  }
-
-  // Play/pause button
-  playerEl.querySelector("[data-player-play]")?.addEventListener("click", () => {
-    if (!activePlayer) return;
-    const p = activePlayer;
-
-    if (p.hasAmbient) {
-      // ── Restart after end ──
-      if (p.phase === "ended") {
-        if (p.ambientEl) { p.ambientEl.volume = 0.25; p.ambientEl.currentTime = 0; }
-        p.panelEl.currentTime = 0;
-        p.phase = "pre-roll";
-        p.preRollPosAtStart = 0;
-        p.fadeOutPosAtStart = 0;
-        p.phaseStartMs = performance.now();
-        p.ambientEl?.play().catch(() => {});
-        startPlayerTick(p);
-        setPlayerBtnState(playerEl, true);
-        p.playing = true;
-        updateMediaSession(true);
-        duckST();
-        return;
-      }
-
-      const isPlaying = !(p.ambientEl?.paused ?? true);
-
-      if (isPlaying) {
-        // Pause — accumulate progress in current phase
-        stopPlayerTick(p);
-        if (p.phase === "pre-roll") {
-          const elapsed = (performance.now() - p.phaseStartMs) / 1000 / p.panelEl.playbackRate;
-          p.preRollPosAtStart = Math.min(1, p.preRollPosAtStart + elapsed);
-          p.phaseStartMs = null;
-        } else if (p.phase === "fade-out") {
-          const elapsed = (performance.now() - p.phaseStartMs) / 1000 / (p.ambientEl?.playbackRate || 1);
-          p.fadeOutPosAtStart = Math.min(1, p.fadeOutPosAtStart + elapsed);
-          p.phaseStartMs = null;
-        }
-        p.playing = false;
-        p.ambientEl?.pause();
-        p.panelEl.pause();
-        setPlayerBtnState(playerEl, false);
-        updateMediaSession(false);
-        restoreSTFade();
-      } else {
-        // Resume — phaseStartMs restarts from accumulated pos
-        if (p.phase === "pre-roll") {
-          p.phaseStartMs = performance.now();
-          p.ambientEl?.play().catch(() => {});
-        } else if (p.phase === "playing") {
-          p.ambientEl?.play().catch(() => {});
-          p.panelEl.play().catch(() => {});
-        } else if (p.phase === "fade-out") {
-          p.phaseStartMs = performance.now();
-          if (p.ambientEl) {
-            p.ambientEl.volume = Math.max(0, 0.25 * (1 - p.fadeOutPosAtStart));
-            p.ambientEl.play().catch(() => {});
-          }
-        }
-        startPlayerTick(p);
-        setPlayerBtnState(playerEl, true);
-        p.playing = true;
-        updateMediaSession(true);
-        duckST();
-      }
-    } else {
-      // ── Modo B ──
-      if (p.phase === "ended" || p.panelEl.ended) {
-        p.panelEl.currentTime = 0;
-        p.phase = "playing";
-        p.panelEl.play().catch(() => {});
-        startPlayerTick(p);
-        setPlayerBtnState(playerEl, true);
-        p.playing = true;
-        updateMediaSession(true);
-        duckST();
-        return;
-      }
-      if (p.panelEl.paused) {
-        p.panelEl.play().catch(() => {});
-        startPlayerTick(p);
-        setPlayerBtnState(playerEl, true);
-        p.playing = true;
-        updateMediaSession(true);
-        duckST();
-      } else {
-        p.playing = false;
-        p.panelEl.pause();
-        stopPlayerTick(p);
-        setPlayerBtnState(playerEl, false);
-        updateMediaSession(false);
-        restoreSTFade();
-      }
+  // Restoration is driven by the media event itself, not by the UI timer
+  // (throttled while locked). No { once } so replays also trigger it.
+  panelEl.addEventListener("ended", () => {
+    if (activePlayer !== p) return;
+    if (!hasAmbient) {
+      finishNarration(p, "ended");
+      return;
     }
-  });
+    // Modo A: the voice is over; the ambient fades out for one more second.
+    if (p.phase !== "playing") return;
+    enterFadeOut(p);
+    narrationDucking.finish(p.token);
+    startPlayerTick(p);
+  }, { signal });
 
-  // Seekbar interaction
+  // Terminal media error while playback is requested.
+  panelEl.addEventListener("error", () => {
+    if (activePlayer !== p || !p.playing) return;
+    failNarration(p, panelEl.error);
+  }, { signal });
+
+  // Recover once per play request from an unexpected OS-level pause (volume
+  // buttons, Bluetooth hiccups…). A second one is treated as an interruption
+  // (call, another app): the narration is shown paused and the music restored
+  // instead of fighting it. Pauses issued by the player itself (seeking into
+  // the pre-roll/fade-out) are not recoveries.
+  panelEl.addEventListener("pause", () => {
+    if (activePlayer !== p || !p.playing || panelEl.ended) return;
+    if (hasAmbient && p.phase !== "playing") return;
+    if (p.recoveredSeq === p.playSeq) {
+      logAudio("narration:interrupted");
+      pauseNarration(p);
+      return;
+    }
+    p.recoveredSeq = p.playSeq;
+    playNarrationMedia(p, panelEl);
+  }, { signal });
+
+  playerEl.querySelector("[data-player-play]")?.addEventListener("click", () => {
+    if (activePlayer !== p) return;
+    if (p.playing) pauseNarration(p);
+    else startNarration(p);
+  }, { signal });
+
   if (seekbar) {
-    seekbar.addEventListener("mousedown", () => { if (activePlayer) activePlayer.isSeeking = true; });
-    seekbar.addEventListener("touchstart", () => { if (activePlayer) activePlayer.isSeeking = true; }, { passive: true });
+    seekbar.addEventListener("mousedown", () => { p.isSeeking = true; }, { signal });
+    seekbar.addEventListener("touchstart", () => { p.isSeeking = true; }, { passive: true, signal });
     seekbar.addEventListener("input", () => {
-      if (!activePlayer) return;
-      const vt = (parseInt(seekbar.value, 10) / 1000) * activePlayer.totalDuration;
-      updatePlayerUI(activePlayer, vt);
-    });
+      if (activePlayer !== p) return;
+      const vt = (parseInt(seekbar.value, 10) / 1000) * p.totalDuration;
+      updatePlayerUI(p, vt);
+    }, { signal });
     seekbar.addEventListener("change", () => {
-      if (!activePlayer) return;
-      activePlayer.isSeeking = false;
-      const vt = (parseInt(seekbar.value, 10) / 1000) * activePlayer.totalDuration;
+      if (activePlayer !== p) return;
+      p.isSeeking = false;
+      const vt = (parseInt(seekbar.value, 10) / 1000) * p.totalDuration;
       seekPlayer(vt);
-    });
+    }, { signal });
   }
+
+  syncMediaSession();
+  return p;
 }
 
 function togglePanel(panelId) {
@@ -2354,34 +2820,8 @@ function togglePanel(panelId) {
         const panelEl = contentEl.querySelector('audio[data-role="panel"]');
         const ambientEl = contentEl.querySelector('audio[data-role="ambient"]');
         if (!panelEl) return;
-
-        const setupAndStart = () => {
-          const panelDuration = panelEl.duration;
-          const totalDuration = ambientEl ? panelDuration + 2 : panelDuration;
-          initPlayer(contentEl, panelEl, ambientEl || null, totalDuration, panelDuration);
-          if (autoPlay) {
-            duckSTFade(() => {
-              const p = activePlayer;
-              if (!p) return;
-              if (p.hasAmbient) {
-                p.phaseStartMs = performance.now();
-                ambientEl.play().catch(() => {});
-              } else {
-                panelEl.play().catch(() => {});
-              }
-              startPlayerTick(p);
-              setPlayerBtnState(p.playerEl, true);
-              p.playing = true;
-              updateMediaSession(true);
-            });
-          }
-        };
-
-        if (isFinite(panelEl.duration) && panelEl.duration > 0) {
-          setupAndStart();
-        } else {
-          panelEl.addEventListener("loadedmetadata", setupAndStart, { once: true });
-        }
+        const p = attachPlayer(contentEl, panelEl, ambientEl || null);
+        if (p && autoPlay) startNarration(p);
       }
     }
   }
@@ -2390,7 +2830,7 @@ function togglePanel(panelId) {
 function collapseBranch(panelId) {
   stopActivePlayer();
   const contentEl = document.getElementById(`${panelId}-content`);
-  contentEl?.querySelectorAll("audio").forEach((a) => a.pause());
+  contentEl?.querySelectorAll("audio").forEach(pauseMedia);
   expandedPanels.delete(panelId);
   revealedDescriptions.delete(panelId);
   const children = accordionIndex.childrenByParent.get(panelId) || [];

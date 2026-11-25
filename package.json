@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node scripts/i18n-check.cjs"
+    "test": "node scripts/i18n-check.cjs && npm run test:audio",
+    "test:audio": "node --test \"tests/audio/*.test.js\""
   },
   "devDependencies": {
     "vite": "^8.0.1"
